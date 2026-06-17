@@ -957,6 +957,12 @@ impl ObscuraJsRuntime {
         state.dom.as_ref().map(f)
     }
 
+    /// Absolute URLs the page requested via fetch()/XHR, in request order
+    /// (issue #301). Backs `--dump assets`.
+    pub fn fetched_urls(&self) -> Vec<String> {
+        self.state.borrow().fetched_urls.clone()
+    }
+
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
         let r = self.state.borrow();
         if r.dom.is_some() {

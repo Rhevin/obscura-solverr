@@ -1160,7 +1160,30 @@ fn extract_assets(dom: &obscura_dom::DomTree, base_url: Option<&url::Url>) -> St
 
 fn dump_assets(page: &Page) -> String {
     let base_url = page.url.clone();
-    page.with_dom(|dom| extract_assets(dom, base_url.as_ref())).unwrap_or_default()
+    let dom_ndjson = page
+        .with_dom(|dom| extract_assets(dom, base_url.as_ref()))
+        .unwrap_or_default();
+
+    let mut lines: Vec<String> =
+        dom_ndjson.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+
+    // URLs already listed from static DOM attributes, so a resource the script
+    // fetches that the markup also references is not emitted twice.
+    let mut seen: std::collections::HashSet<String> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    // Resources pulled in by JS fetch()/XHR, which leave no static DOM tag
+    // (issue #301).
+    for url in page.fetched_urls() {
+        if seen.insert(url.clone()) {
+            lines.push(serde_json::json!({ "url": url, "type": "fetch" }).to_string());
+        }
+    }
+
+    lines.join("\n")
 }
 
 #[cfg(test)]

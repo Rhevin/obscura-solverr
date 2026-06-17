@@ -1211,6 +1211,12 @@ impl Page {
         self.dom.as_ref().map(f)
     }
 
+    /// Absolute URLs the page pulled in via fetch()/XHR (issue #301). Empty
+    /// when the page has no live JS runtime.
+    pub fn fetched_urls(&self) -> Vec<String> {
+        self.js.as_ref().map(|js| js.fetched_urls()).unwrap_or_default()
+    }
+
     pub fn dom(&self) -> Option<&DomTree> {
         self.dom.as_ref()
     }

@@ -66,6 +66,10 @@ pub struct ObscuraState {
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
     pub network_response_body_counter: u64,
+    // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
+    // order. Surfaced by `--dump assets` so resources pulled in by script, not
+    // just static DOM attributes, are listed (issue #301).
+    pub fetched_urls: Vec<String>,
 }
 
 impl ObscuraState {
@@ -86,6 +90,7 @@ impl ObscuraState {
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
+            fetched_urls: Vec::new(),
         }
     }
 }
@@ -620,6 +625,10 @@ async fn op_fetch_url(
                 }).to_string());
             }
         }
+        // Record the resource the page pulled in via fetch()/XHR so `--dump
+        // assets` can list it (issue #301). URL is already absolute here, since
+        // reqwest needs an absolute URL to send the request.
+        gs.fetched_urls.push(url.clone());
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         // #139: thread the configured proxy through to the per-request
