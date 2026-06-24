@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
-use obscura_net::{ObscuraHttpClient, ObscuraNetError, Response};
+use obscura_net::{ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
 use url::Url;
 
 use crate::context::BrowserContext;
@@ -1524,6 +1524,46 @@ impl Page {
 
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
         self.preload_scripts = scripts;
+    }
+
+    /// Append a script that runs in the page before any of the page's own
+    /// `<script>` tags, matching CDP `Page.addScriptToEvaluateOnNewDocument`.
+    /// Takes effect on the next navigation (`goto` / `navigate*`).
+    pub fn add_preload_script(&mut self, script: &str) {
+        self.preload_scripts.push(script.to_string());
+    }
+
+    /// Enable CDP-Fetch-style interception of JS-initiated `fetch()`/XHR.
+    /// Returns a receiver yielding every such request; resolve each through its
+    /// `resolver` with `InterceptResolution::{Continue, Fulfill, Fail}` to pass,
+    /// mock, or block it. Works in stealth and non-stealth. Mirrors how the CDP
+    /// server wires the channel (`obscura-cdp/src/server.rs`).
+    pub fn enable_interception(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest> {
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
+        self.set_intercept_tx(tx);
+        self.enable_intercept(true);
+        rx
+    }
+
+    /// Register a passive callback fired for every JS `fetch()`/XHR (and
+    /// navigation) request, once the method/headers/body are known and before it
+    /// is sent. Non-blocking; use `enable_interception` to mutate or block.
+    pub fn on_request(&mut self, cb: RequestCallback) {
+        if let Ok(mut v) = self.http_client.on_request.try_write() {
+            v.push(cb);
+        }
+    }
+
+    /// Register a passive callback fired with every JS `fetch()`/XHR (and
+    /// navigation) response, including its body. Non-blocking. The main path for
+    /// crawlers that need to capture API response payloads.
+    pub fn on_response(&mut self, cb: ResponseCallback) {
+        if let Ok(mut v) = self.http_client.on_response.try_write() {
+            v.push(cb);
+        }
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {

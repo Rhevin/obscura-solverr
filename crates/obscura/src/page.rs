@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use obscura_browser::lifecycle::WaitUntil;
-use obscura_browser::Page as InnerPage;
+use obscura_browser::{InterceptedRequest, Page as InnerPage};
+use obscura_net::{RequestCallback, ResponseCallback};
 use serde_json::Value;
 
 use crate::error::Error;
@@ -90,6 +91,39 @@ impl Page {
     /// resolve scheduled microtasks/macrotasks before the next `evaluate()`.
     pub async fn settle(&mut self, max_ms: u64) {
         self.inner.settle(max_ms).await
+    }
+
+    /// Register a script that runs before any of the page's own `<script>` tags,
+    /// equivalent to CDP `Page.addScriptToEvaluateOnNewDocument`. Runs on the next
+    /// `goto()` / navigation. Use it to install a fetch()/XHR interceptor or any
+    /// other page-init logic before the page's bootstrap runs.
+    pub fn add_preload_script(&mut self, script: &str) {
+        self.inner.add_preload_script(script);
+    }
+
+    /// Enable CDP-Fetch-style interception of every JS `fetch()`/XHR. Returns a
+    /// receiver yielding each request; resolve it through its `resolver` with
+    /// [`obscura::InterceptResolution`] (`Continue`, `Fulfill`, `Fail`) to pass,
+    /// mock, or block it. Works in stealth and non-stealth.
+    pub fn enable_interception(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest> {
+        self.inner.enable_interception()
+    }
+
+    /// Register a passive callback fired for every request the page makes
+    /// (navigation and JS `fetch()`/XHR), once its method/headers/body are known
+    /// and before it is sent. Non-blocking; use `enable_interception` to mutate
+    /// or block.
+    pub fn on_request(&mut self, cb: RequestCallback) {
+        self.inner.on_request(cb);
+    }
+
+    /// Register a passive callback fired with every response the page receives
+    /// (navigation and JS `fetch()`/XHR), including its body. Non-blocking. The
+    /// main path for capturing API response payloads from SPAs.
+    pub fn on_response(&mut self, cb: ResponseCallback) {
+        self.inner.on_response(cb);
     }
 }
 

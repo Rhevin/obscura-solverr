@@ -8,7 +8,7 @@ use deno_core::OpState;
 use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CookieJar, ObscuraHttpClient};
+use obscura_net::{CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use tokio::sync::Mutex;
@@ -619,7 +619,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -651,7 +651,7 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx, proxy_url)
+        (jar, in_flight, itx, proxy_url, gs.http_client.clone())
     };
 
     if let Some((tx, request_id)) = intercept_tx {
@@ -716,6 +716,27 @@ async fn op_fetch_url(
     let custom_headers: std::collections::HashMap<String, String> =
         serde_json::from_str(&headers_json).unwrap_or_default();
 
+    // Passive request observation (non-blocking). Fires for every request that
+    // reaches the network (Fulfill/Fail from the interception channel short-
+    // circuit earlier). on_request/on_response previously fired only for
+    // navigation; this wires them for JS fetch()/XHR too.
+    if let Some(ref hc) = http_client {
+        let cbs = hc.on_request.read().await;
+        if !cbs.is_empty() {
+            if let Ok(parsed) = url::Url::parse(&url) {
+                let info = RequestInfo {
+                    url: parsed,
+                    method: method.clone(),
+                    headers: custom_headers.clone(),
+                    resource_type: ResourceType::Fetch,
+                };
+                for cb in cbs.iter() {
+                    cb(&info);
+                }
+            }
+        }
+    }
+
     // Stealth mode: route the scripted request through the wreq client so its
     // TLS fingerprint and Chrome client hints match the main navigation. The
     // rustls ClientHello plus missing client hints that op_fetch_url's reqwest
@@ -739,6 +760,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 is_cross_origin,
                 mode.clone(),
+                http_client.clone(),
             )
             .await;
         }
@@ -944,6 +966,21 @@ async fn op_fetch_url(
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    if let Some(ref hc) = http_client {
+        let cbs = hc.on_response.read().await;
+        if !cbs.is_empty() {
+            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
+            let info = RequestInfo {
+                url: resp.url.clone(),
+                method: method.clone(),
+                headers: resp_headers.clone(),
+                resource_type: ResourceType::Fetch,
+            };
+            for cb in cbs.iter() {
+                cb(&info, &resp);
+            }
+        }
+    }
     let response_request_id = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
@@ -989,6 +1026,16 @@ async fn op_fetch_url(
 /// handling lives inside StealthHttpClient::send_single, which shares the
 /// context jar. Response bodies are not mirrored into the CDP
 /// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+fn fetch_response(url: &str, status: u16, headers: HashMap<String, String>, body: Vec<u8>) -> Response {
+    Response {
+        url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
+        status,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    }
+}
+
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
@@ -999,6 +1046,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     is_cross_origin: bool,
     mode: String,
+    http_client: Option<Arc<ObscuraHttpClient>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -1086,6 +1134,21 @@ async fn stealth_fetch_all(
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    if let Some(ref hc) = http_client {
+        let cbs = hc.on_response.read().await;
+        if !cbs.is_empty() {
+            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
+            let info = RequestInfo {
+                url: resp.url.clone(),
+                method: current_method.clone(),
+                headers: resp_headers.clone(),
+                resource_type: ResourceType::Fetch,
+            };
+            for cb in cbs.iter() {
+                cb(&info, &resp);
+            }
+        }
+    }
 
     Ok(serde_json::json!({
         "status": status,
