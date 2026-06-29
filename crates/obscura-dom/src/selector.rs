@@ -167,6 +167,15 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
     type Impl = ObscuraSelector;
     type Error = SelectorParseErrorKind<'i>;
 
+    // Allow `:has()`. The selectors crate gates relative-selector parsing on
+    // this (default false), so without it `a:has(p)` failed to parse and the
+    // error was swallowed into an empty match set. Matching already passes a
+    // SelectorCaches (which holds the relative-selector cache), so enabling
+    // parsing is sufficient.
+    fn parse_has(&self) -> bool {
+        true
+    }
+
     fn parse_non_ts_pseudo_class(
         &self,
         _location: cssparser::SourceLocation,
@@ -219,7 +228,18 @@ impl<'a> Element for DomElement<'a> {
     type Impl = ObscuraSelector;
 
     fn opaque(&self) -> OpaqueElement {
-        OpaqueElement::new(self)
+        // Must be stable per node. DomElement is Copy and gets a fresh stack
+        // address on every traversal step, so OpaqueElement::new(self) returns a
+        // different id for the same node each call. That breaks `:has` anchor
+        // matching, which compares the anchor's opaque against the element
+        // reached by walking up the tree. Key off the node's stable slot in the
+        // tree's Vec instead (OpaqueElement only compares the address, never
+        // dereferences it, and the Vec is not mutated during a query).
+        let inner = self.tree.borrow_inner();
+        match inner.nodes.get(self.node_id.index()) {
+            Some(slot) => OpaqueElement::new(slot),
+            None => OpaqueElement::new(self),
+        }
     }
 
     fn parent_element(&self) -> Option<Self> {
@@ -664,6 +684,21 @@ mod tests {
         let tree = parse_html("<ul><li>1</li><li>2</li><li>3</li></ul>");
         let results = tree.query_selector_all("li").unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_has_parses() {
+        // Isolate parse from match: :has must parse, not error.
+        assert!(super::parse_selector("a:has(p.bt)").is_ok(), ":has failed to parse");
+    }
+
+    #[test]
+    fn test_query_selector_has() {
+        let tree = parse_html(r#"<a><p class="bt">x</p></a>"#);
+        let all = tree.query_selector_all("a:has(p.bt)").unwrap();
+        assert_eq!(all.len(), 1, "a:has(p.bt) should match the <a>");
+        let none = tree.query_selector_all("a:has(span.bt)").unwrap();
+        assert_eq!(none.len(), 0, "a:has(span.bt) should match nothing");
     }
 
     #[test]
