@@ -40,13 +40,13 @@ impl ServerState {
 /// Apply solver-friendly defaults when not already configured by the operator.
 pub fn apply_solver_env_defaults() {
     if std::env::var("OBSCURA_SCRIPT_DEADLINE_MS").is_err() {
-        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "60000");
+        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "120000");
     }
     if std::env::var("OBSCURA_NAV_TIMEOUT_MS").is_err() {
-        std::env::set_var("OBSCURA_NAV_TIMEOUT_MS", "60000");
+        std::env::set_var("OBSCURA_NAV_TIMEOUT_MS", "130000");
     }
     if std::env::var("OBSCURA_FETCH_TIMEOUT_MS").is_err() {
-        std::env::set_var("OBSCURA_FETCH_TIMEOUT_MS", "60000");
+        std::env::set_var("OBSCURA_FETCH_TIMEOUT_MS", "120000");
     }
 }
 
@@ -193,7 +193,7 @@ async fn handle_request_get(state: &mut ServerState, req: RequestBody) -> Respon
     let Some(url) = req.url.filter(|u| !u.trim().is_empty()) else {
         return ResponseBody::err("url is required");
     };
-    let max_timeout = req.max_timeout.unwrap_or(60_000).max(1_000).min(120_000);
+    let max_timeout = req.max_timeout.unwrap_or(120_000).max(1_000).min(300_000);
 
     if let Some(session_id) = req.session.clone() {
         if let Err(e) = state.sessions.touch(&session_id) {
@@ -237,7 +237,7 @@ mod tests {
         apply_solver_env_defaults();
         assert_eq!(
             std::env::var("OBSCURA_SCRIPT_DEADLINE_MS").unwrap(),
-            "60000"
+            "120000"
         );
     }
 }

@@ -363,6 +363,12 @@ impl Page {
         }
     }
 
+    /// Re-run parser-discovered scripts (e.g. after a Cloudflare challenge page loads).
+    pub async fn execute_page_scripts(&mut self) {
+        self.cancel_v8_termination();
+        self.execute_scripts().await;
+    }
+
     async fn execute_scripts(&mut self) {
         tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
         // Compute document base URL, respecting <base href>.
@@ -757,7 +763,9 @@ impl Page {
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
-                js.disarm_watchdog(token);
+                if js.disarm_watchdog(token) {
+                    js.cancel_termination();
+                }
             }
         }
     }
