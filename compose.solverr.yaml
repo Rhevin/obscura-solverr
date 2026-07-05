@@ -1,9 +1,20 @@
 # FlareSolverr-compatible API on :8191 (drop-in for mangadl-go / Prowlarr / *arr).
 #
+# Pull pre-built image from GHCR (published on git tag v*):
+#   docker compose -f compose.solverr.yaml pull
+#   docker compose -f compose.solverr.yaml up -d
+#
+# Pin a release: image: ghcr.io/rhevin/obscura-solverr:1.0.0
+#
+# Build locally instead (needs BuildKit for cache mounts):
 #   docker compose -f compose.solverr.yaml up -d --build
 #
+name: obscura-solverr
+
 services:
   obscura-solverr:
+    image: ghcr.io/rhevin/obscura-solverr:latest
+    container_name: obscura-solverr
     build:
       context: .
       args:
