@@ -1,0 +1,24 @@
+[package]
+name = "obscura-solverr"
+version.workspace = true
+edition.workspace = true
+description = "FlareSolverr-compatible Cloudflare bypass API for Obscura"
+license.workspace = true
+
+[features]
+default = []
+stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
+
+[dependencies]
+obscura-browser = { workspace = true }
+obscura-net = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

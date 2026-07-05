@@ -183,6 +183,25 @@ enum Command {
         user_agent: Option<String>,
     },
 
+    /// FlareSolverr-compatible Cloudflare bypass API (port 8191).
+    Solverr {
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        #[arg(short, long, default_value_t = 8191)]
+        port: u16,
+
+        #[arg(long)]
+        proxy: Option<String>,
+
+        #[arg(long)]
+        user_agent: Option<String>,
+
+        /// Max requests per browser session before clients should recreate it.
+        #[arg(long, default_value_t = 25)]
+        max_session_requests: u32,
+    },
+
 }
 
 
@@ -391,6 +410,24 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
             }
+        }
+        Some(Command::Solverr {
+            host,
+            port,
+            proxy,
+            user_agent,
+            max_session_requests,
+        }) => {
+            let solver_proxy = merge_proxy(global_proxy.clone(), proxy);
+            obscura_solverr::run(obscura_solverr::ServerConfig {
+                host,
+                port,
+                stealth,
+                proxy: solver_proxy,
+                user_agent,
+                max_requests_per_session: max_session_requests,
+            })
+            .await?;
         }
         None => {
             print_banner(args.port);

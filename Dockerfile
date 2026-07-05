@@ -17,10 +17,11 @@ COPY crates/obscura-browser/Cargo.toml   crates/obscura-browser/Cargo.toml
 COPY crates/obscura-cdp/Cargo.toml       crates/obscura-cdp/Cargo.toml
 COPY crates/obscura-js/Cargo.toml        crates/obscura-js/Cargo.toml
 COPY crates/obscura-mcp/Cargo.toml       crates/obscura-mcp/Cargo.toml
+COPY crates/obscura-solverr/Cargo.toml crates/obscura-solverr/Cargo.toml
 COPY crates/obscura-cli/Cargo.toml       crates/obscura-cli/Cargo.toml
 
 # Create stub src files so cargo can resolve the dependency graph
-RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js obscura-mcp; do \
+RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js obscura-mcp obscura-solverr; do \
         mkdir -p crates/$crate/src && echo "// stub" > crates/$crate/src/lib.rs; \
     done && \
     mkdir -p crates/obscura-cli/src && \
@@ -34,7 +35,7 @@ ARG OBSCURA_VERSION
 # Copy real sources and build
 COPY crates/ crates/
 RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
-    touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker
+    touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker --features stealth
 
 # ---
 
@@ -44,10 +45,10 @@ FROM gcr.io/distroless/cc-debian12
 COPY --from=builder /build/target/release/obscura /obscura
 COPY --from=builder /build/target/release/obscura-worker /obscura-worker
 
-EXPOSE 9222
+EXPOSE 9222 8191
 
 # Bind to 0.0.0.0 so the port is reachable via `docker run -p 9222:9222`.
 # Native binary still defaults to 127.0.0.1 (loopback only) — this override
 # is just for the container.
 ENTRYPOINT ["/obscura"]
-CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]
+CMD ["serve", "--port", "9222", "--host", "0.0.0.0", "--stealth"]
