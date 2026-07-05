@@ -1,14 +1,14 @@
-FROM rust:1-slim-bookworm AS builder
+FROM rust:1-slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         perl \
-        make \
         git \
         cmake \
         pkg-config \
         clang \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -44,7 +44,7 @@ RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
 # ---
 
 # distroless/cc: glibc + libgcc + CA certs only — no shell, no package manager
-FROM gcr.io/distroless/cc-debian12
+FROM gcr.io/distroless/cc-debian13
 
 COPY --from=builder /build/target/release/obscura /obscura
 COPY --from=builder /build/target/release/obscura-worker /obscura-worker
