@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 FROM rust:1-slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,22 +34,29 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
     echo "fn main() {}" > crates/obscura-cli/src/main.rs && \
     echo "fn main() {}" > crates/obscura-cli/src/worker.rs
 
-RUN cargo build --release --bin obscura --bin obscura-worker --features stealth 2>/dev/null || true
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release --bin obscura --bin obscura-worker --features stealth 2>/dev/null || true
 
 ARG OBSCURA_VERSION
 
 # Copy real sources and build
 COPY crates/ crates/
-RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
-    touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker --features stealth
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
+    touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker --features stealth && \
+    cp /build/target/release/obscura /build/target/release/obscura-worker /tmp/
 
 # ---
 
 # distroless/cc: glibc + libgcc + CA certs only — no shell, no package manager
 FROM gcr.io/distroless/cc-debian13
 
-COPY --from=builder /build/target/release/obscura /obscura
-COPY --from=builder /build/target/release/obscura-worker /obscura-worker
+COPY --from=builder /tmp/obscura /obscura
+COPY --from=builder /tmp/obscura-worker /obscura-worker
 
 EXPOSE 9222 8191
 
