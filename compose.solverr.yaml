@@ -1,0 +1,28 @@
+# FlareSolverr-compatible API on :8191 (drop-in for mangadl-go / Prowlarr / *arr).
+#
+#   docker compose -f compose.solverr.yaml up -d --build
+#
+services:
+  obscura-solverr:
+    build:
+      context: .
+      args:
+        OBSCURA_VERSION: solverr
+    command:
+      - solverr
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8191"
+      - --stealth
+    ports:
+      - "8191:8191"
+    environment:
+      OBSCURA_SCRIPT_DEADLINE_MS: "60000"
+      OBSCURA_NAV_TIMEOUT_MS: "60000"
+      RUST_LOG: obscura=info,obscura_solverr=info
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 768M

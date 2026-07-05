@@ -1689,6 +1689,7 @@ dependencies = [
  "obscura-js",
  "obscura-mcp",
  "obscura-net",
+ "obscura-solverr",
  "serde",
  "serde_json",
  "tokio",
@@ -1772,6 +1773,21 @@ dependencies = [
  "url",
  "wreq",
  "wreq-util",
+]
+
+[[package]]
+name = "obscura-solverr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "obscura-browser",
+ "obscura-net",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
