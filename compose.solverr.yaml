@@ -29,6 +29,8 @@ services:
     ports:
       - "8191:8191"
     environment:
+      # Short first-pass script budget; full budget applied on CF retry (see solve.rs).
+      OBSCURA_SOLVERR_INITIAL_SCRIPT_MS: "45000"
       OBSCURA_SCRIPT_DEADLINE_MS: "120000"
       OBSCURA_NAV_TIMEOUT_MS: "130000"
       OBSCURA_FETCH_TIMEOUT_MS: "120000"
@@ -38,3 +40,4 @@ services:
       resources:
         limits:
           memory: 768M
+          cpus: "1.0"

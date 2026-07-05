@@ -10,9 +10,22 @@ use tokio::time::{timeout, Instant};
 use crate::api::{FlareCookie, Solution};
 use crate::challenge::{has_cf_clearance, is_cloudflare_challenge};
 
+/// First navigation often hits a CF inline script that blocks until the watchdog
+/// fires; the successful path is usually an immediate re-run with a full budget.
+const DEFAULT_INITIAL_SCRIPT_MS: u64 = 45_000;
+
 /// Align Obscura engine timeouts with the FlareSolverr `maxTimeout` for this request.
-pub fn apply_request_timeouts(max_timeout_ms: u64) {
-    let script_ms = max_timeout_ms.saturating_sub(5_000).max(30_000);
+pub fn apply_request_timeouts(max_timeout_ms: u64, retry_scripts: bool) {
+    let initial_ms = std::env::var("OBSCURA_SOLVERR_INITIAL_SCRIPT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_INITIAL_SCRIPT_MS);
+    let full_script_ms = max_timeout_ms.saturating_sub(5_000).max(30_000);
+    let script_ms = if retry_scripts {
+        full_script_ms
+    } else {
+        initial_ms.min(full_script_ms)
+    };
     // Navigation includes fetch + script execution + load events; give a little headroom.
     let nav_ms = max_timeout_ms.saturating_add(10_000);
     std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", script_ms.to_string());
@@ -39,7 +52,7 @@ pub async fn solve_get(
     url: &str,
     max_timeout_ms: u64,
 ) -> Result<SolveResult> {
-    apply_request_timeouts(max_timeout_ms);
+    apply_request_timeouts(max_timeout_ms, false);
     let overall = Instant::now() + Duration::from_millis(max_timeout_ms);
 
     // Load (not networkidle0): CF challenge pages keep background requests open.
@@ -54,11 +67,11 @@ pub async fn solve_get(
     page.cancel_v8_termination();
 
     let mut saw_challenge = false;
-    let mut last_script_rerun = Instant::now() - Duration::from_secs(3600);
+    let mut challenge_retry_done = false;
+    let mut last_script_rerun = Instant::now();
 
     loop {
         page.cancel_v8_termination();
-        page.settle(2_000).await;
 
         let html = page_html(page);
         let cookies = context.cookie_jar.get_all_cookies();
@@ -66,12 +79,28 @@ pub async fn solve_get(
 
         if challenged {
             saw_challenge = true;
-            // Re-run skipped scripts after watchdog termination; throttle to avoid hammering.
-            if !has_cf_clearance(&cookies) && last_script_rerun.elapsed() >= Duration::from_secs(10) {
-                page.execute_page_scripts().await;
-                last_script_rerun = Instant::now();
-                page.settle(3_000).await;
+            if !has_cf_clearance(&cookies) {
+                // Fail-fast nav leaves scripts unfinished; one immediate full-budget re-run
+                // usually completes Turnstile in seconds (see nowsecure.nl traces).
+                let should_rerun = if !challenge_retry_done {
+                    challenge_retry_done = true;
+                    true
+                } else {
+                    last_script_rerun.elapsed() >= Duration::from_secs(30)
+                };
+                if should_rerun {
+                    apply_request_timeouts(max_timeout_ms, true);
+                    page.execute_page_scripts().await;
+                    last_script_rerun = Instant::now();
+                    page.settle(2_000).await;
+                } else {
+                    page.settle(500).await;
+                }
+            } else {
+                page.settle(500).await;
             }
+        } else {
+            page.settle(500).await;
         }
 
         let html = page_html(page);
@@ -89,7 +118,7 @@ pub async fn solve_get(
             anyhow::bail!("Cloudflare challenge not cleared within {max_timeout_ms}ms");
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
     }
 
     let html = page_html(page);
@@ -175,10 +204,12 @@ mod tests {
 
     #[test]
     fn request_timeouts_follow_max_timeout() {
-        apply_request_timeouts(120_000);
-        assert_eq!(std::env::var("OBSCURA_SCRIPT_DEADLINE_MS").unwrap(), "115000");
+        std::env::remove_var("OBSCURA_SOLVERR_INITIAL_SCRIPT_MS");
+        apply_request_timeouts(120_000, false);
+        assert_eq!(std::env::var("OBSCURA_SCRIPT_DEADLINE_MS").unwrap(), "45000");
         assert_eq!(std::env::var("OBSCURA_NAV_TIMEOUT_MS").unwrap(), "130000");
-        assert_eq!(std::env::var("OBSCURA_FETCH_TIMEOUT_MS").unwrap(), "120000");
+        apply_request_timeouts(120_000, true);
+        assert_eq!(std::env::var("OBSCURA_SCRIPT_DEADLINE_MS").unwrap(), "115000");
     }
 
     #[test]
