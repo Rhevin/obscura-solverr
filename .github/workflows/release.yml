@@ -27,19 +27,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: obscura-aarch64-macos
-          - target: x86_64-apple-darwin
-            # Must run on a native Intel runner. obscura-js bakes a V8 startup
-            # snapshot at build time, and that snapshot is architecture specific.
-            # macos-latest is Apple Silicon, so building x86_64 there embeds an
-            # arm64 snapshot into the Intel binary and V8 crashes deserializing
-            # it at isolate init (issue #290). macos-15-intel is the last x86_64
-            # image (available until Aug 2027); there is no cross-build that
-            # produces a correct snapshot.
-            os: macos-15-intel
-            name: obscura-x86_64-macos
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: obscura-x86_64-windows
 
     runs-on: ${{ matrix.os }}
 
@@ -68,23 +55,13 @@ jobs:
           [ -f "$BIN.exe" ] && BIN="$BIN.exe"
           "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.name }}.tar.gz obscura obscura-worker
           cd ../../..
 
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
-          cd ../../..
-
       - name: Upload
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ matrix.name }}.tar.gz
-            ${{ matrix.name }}.zip
+          files: ${{ matrix.name }}.tar.gz
