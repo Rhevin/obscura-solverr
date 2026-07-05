@@ -5,6 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         perl \
         make \
+        git \
+        cmake \
+        pkg-config \
+        clang \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -28,7 +32,7 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
     echo "fn main() {}" > crates/obscura-cli/src/main.rs && \
     echo "fn main() {}" > crates/obscura-cli/src/worker.rs
 
-RUN cargo build --release --bin obscura --bin obscura-worker 2>/dev/null || true
+RUN cargo build --release --bin obscura --bin obscura-worker --features stealth 2>/dev/null || true
 
 ARG OBSCURA_VERSION
 
