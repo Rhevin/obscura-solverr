@@ -5,10 +5,20 @@ use anyhow::{Context as _, Result};
 use obscura_browser::lifecycle::WaitUntil;
 use obscura_browser::{BrowserContext, Page};
 use obscura_net::CookieInfo;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 use crate::api::{FlareCookie, Solution};
 use crate::challenge::{has_cf_clearance, is_cloudflare_challenge};
+
+/// Align Obscura engine timeouts with the FlareSolverr `maxTimeout` for this request.
+pub fn apply_request_timeouts(max_timeout_ms: u64) {
+    let script_ms = max_timeout_ms.saturating_sub(5_000).max(30_000);
+    // Navigation includes fetch + script execution + load events; give a little headroom.
+    let nav_ms = max_timeout_ms.saturating_add(10_000);
+    std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", script_ms.to_string());
+    std::env::set_var("OBSCURA_NAV_TIMEOUT_MS", nav_ms.to_string());
+    std::env::set_var("OBSCURA_FETCH_TIMEOUT_MS", max_timeout_ms.to_string());
+}
 
 pub struct SolveOptions {
     pub url: String,
@@ -29,21 +39,26 @@ pub async fn solve_get(
     url: &str,
     max_timeout_ms: u64,
 ) -> Result<SolveResult> {
-    let wait = WaitUntil::NetworkIdle0;
+    apply_request_timeouts(max_timeout_ms);
+    let overall = Instant::now() + Duration::from_millis(max_timeout_ms);
 
+    // Load (not networkidle0): CF challenge pages keep background requests open.
     timeout(
         Duration::from_millis(max_timeout_ms),
-        page.navigate_with_wait(url, wait),
+        page.navigate_with_wait(url, WaitUntil::Load),
     )
     .await
     .map_err(|_| anyhow::anyhow!("Navigation timed out after {max_timeout_ms}ms"))?
     .with_context(|| format!("Failed to navigate to {url}"))?;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(max_timeout_ms);
+    page.cancel_v8_termination();
+
     let mut saw_challenge = false;
+    let mut last_script_rerun = Instant::now() - Duration::from_secs(3600);
 
     loop {
-        page.settle(500).await;
+        page.cancel_v8_termination();
+        page.settle(2_000).await;
 
         let html = page_html(page);
         let cookies = context.cookie_jar.get_all_cookies();
@@ -51,7 +66,16 @@ pub async fn solve_get(
 
         if challenged {
             saw_challenge = true;
+            // Re-run skipped scripts after watchdog termination; throttle to avoid hammering.
+            if !has_cf_clearance(&cookies) && last_script_rerun.elapsed() >= Duration::from_secs(10) {
+                page.execute_page_scripts().await;
+                last_script_rerun = Instant::now();
+                page.settle(3_000).await;
+            }
         }
+
+        let html = page_html(page);
+        let cookies = context.cookie_jar.get_all_cookies();
 
         if has_cf_clearance(&cookies) {
             break;
@@ -61,7 +85,7 @@ pub async fn solve_get(
             break;
         }
 
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= overall {
             anyhow::bail!("Cloudflare challenge not cleared within {max_timeout_ms}ms");
         }
 
@@ -146,7 +170,16 @@ fn flare_cookies(cookies: &[CookieInfo]) -> Vec<FlareCookie> {
 #[cfg(test)]
 mod tests {
     use super::flare_cookies;
+    use super::apply_request_timeouts;
     use obscura_net::CookieInfo;
+
+    #[test]
+    fn request_timeouts_follow_max_timeout() {
+        apply_request_timeouts(120_000);
+        assert_eq!(std::env::var("OBSCURA_SCRIPT_DEADLINE_MS").unwrap(), "115000");
+        assert_eq!(std::env::var("OBSCURA_NAV_TIMEOUT_MS").unwrap(), "130000");
+        assert_eq!(std::env::var("OBSCURA_FETCH_TIMEOUT_MS").unwrap(), "120000");
+    }
 
     #[test]
     fn maps_cookies_for_api() {

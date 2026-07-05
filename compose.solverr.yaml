@@ -29,8 +29,9 @@ services:
     ports:
       - "8191:8191"
     environment:
-      OBSCURA_SCRIPT_DEADLINE_MS: "60000"
-      OBSCURA_NAV_TIMEOUT_MS: "60000"
+      OBSCURA_SCRIPT_DEADLINE_MS: "120000"
+      OBSCURA_NAV_TIMEOUT_MS: "130000"
+      OBSCURA_FETCH_TIMEOUT_MS: "120000"
       RUST_LOG: obscura=info,obscura_solverr=info
     restart: unless-stopped
     deploy:
