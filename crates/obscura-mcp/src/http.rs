@@ -1,7 +1,8 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::time::Duration;
 
 use crate::{dispatch, BrowserState};
 
@@ -11,6 +12,122 @@ use crate::{dispatch, BrowserState};
 /// that many bytes before reading any body — an unauthenticated OOM/DoS. 16 MiB
 /// is far above any real JSON-RPC tool call.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum time allowed to receive one complete HTTP request (request line,
+/// headers, and body). The deadline is shared across all reads so a client
+/// cannot keep the sequential MCP server occupied by slowly dribbling data.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum RequestBody {
+    NotRead,
+    MissingLength,
+    TooLarge,
+    Read(Vec<u8>),
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    accept_sse: bool,
+    keep_alive: bool,
+    origin: Option<String>,
+    body: RequestBody,
+}
+
+enum RequestRead {
+    Closed,
+    Invalid,
+    Request(HttpRequest),
+}
+
+async fn read_request(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    allowed_origins: Option<&str>,
+) -> Result<RequestRead> {
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).await? == 0 {
+        return Ok(RequestRead::Closed);
+    }
+    let request_line = request_line.trim();
+    if request_line.is_empty() {
+        return Ok(RequestRead::Closed);
+    }
+
+    let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
+    if parts.len() < 3 {
+        return Ok(RequestRead::Invalid);
+    }
+    let method = parts[0].to_string();
+    let path = parts[1].to_string();
+
+    let mut content_length: Option<usize> = None;
+    let mut accept_sse = false;
+    let mut keep_alive = false;
+    let mut origin: Option<String> = None;
+
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        let trimmed = line.trim_end_matches("\r\n").trim_end_matches('\n');
+        if trimmed.is_empty() {
+            break;
+        }
+        let lower = trimmed.to_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length: ") {
+            content_length = v.trim().parse().ok();
+        }
+        if lower.starts_with("origin:") {
+            if let Some(idx) = trimmed.find(':') {
+                origin = Some(trimmed[idx + 1..].trim().to_string());
+            }
+        }
+        if lower.contains("text/event-stream") {
+            accept_sse = true;
+        }
+        if lower.starts_with("connection: ") && lower.contains("keep-alive") {
+            keep_alive = true;
+        }
+    }
+
+    // Only consume a body for a POST that can reach the MCP route. Invalid
+    // paths and forbidden origins retain the existing early-response behavior.
+    let body = if method == "POST"
+        && path == "/mcp"
+        && origin_allowed(origin.as_deref(), allowed_origins)
+    {
+        match content_length {
+            None => RequestBody::MissingLength,
+            // Reject the client-supplied size before allocating the body.
+            Some(len) if len > MAX_BODY_BYTES => RequestBody::TooLarge,
+            Some(len) => {
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).await?;
+                RequestBody::Read(body)
+            }
+        }
+    } else {
+        RequestBody::NotRead
+    };
+
+    Ok(RequestRead::Request(HttpRequest {
+        method,
+        path,
+        accept_sse,
+        keep_alive,
+        origin,
+        body,
+    }))
+}
+
+async fn read_request_with_timeout(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    allowed_origins: Option<&str>,
+    timeout: Duration,
+) -> Result<RequestRead> {
+    tokio::time::timeout(timeout, read_request(reader, allowed_origins))
+        .await
+        .map_err(|_| anyhow::anyhow!("request read timed out"))?
+}
 
 /// Origin allowlist for browser callers, read from `OBSCURA_MCP_ALLOWED_ORIGINS`
 /// (comma-separated). Unset/empty → permissive (unchanged `*`) so hosted
@@ -87,52 +204,24 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
 
     loop {
-        // ── request line ─────────────────────────────────────────────────────
-        let mut request_line = String::new();
-        if reader.read_line(&mut request_line).await? == 0 {
-            break;
-        }
-        let request_line = request_line.trim().to_string();
-        if request_line.is_empty() {
-            break;
-        }
-
-        let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
-        if parts.len() < 3 {
-            break;
-        }
-        let method = parts[0];
-        let path = parts[1];
-
-        // ── headers ──────────────────────────────────────────────────────────
-        let mut content_length: Option<usize> = None;
-        let mut accept_sse = false;
-        let mut keep_alive = false;
-        let mut origin: Option<String> = None;
-
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
-            let trimmed = line.trim_end_matches("\r\n").trim_end_matches('\n');
-            if trimmed.is_empty() {
-                break;
-            }
-            let lower = trimmed.to_lowercase();
-            if let Some(v) = lower.strip_prefix("content-length: ") {
-                content_length = v.trim().parse().ok();
-            }
-            if lower.starts_with("origin:") {
-                if let Some(idx) = trimmed.find(':') {
-                    origin = Some(trimmed[idx + 1..].trim().to_string());
-                }
-            }
-            if lower.contains("text/event-stream") {
-                accept_sse = true;
-            }
-            if lower.starts_with("connection: ") && lower.contains("keep-alive") {
-                keep_alive = true;
-            }
-        }
+        let request = match read_request_with_timeout(
+            &mut reader,
+            allowed_origins,
+            REQUEST_READ_TIMEOUT,
+        )
+        .await?
+        {
+            RequestRead::Closed | RequestRead::Invalid => break,
+            RequestRead::Request(request) => request,
+        };
+        let HttpRequest {
+            method,
+            path,
+            accept_sse,
+            keep_alive,
+            origin,
+            body,
+        } = request;
 
         // ── routing ──────────────────────────────────────────────────────────
         if path != "/mcp" {
@@ -151,7 +240,7 @@ async fn handle_connection(
         }
         let cors = cors_header(origin.as_deref(), allowed_origins);
 
-        match method {
+        match method.as_str() {
             "OPTIONS" => {
                 // mcp-protocol-version is part of the MCP spec, Authorization /
                 // X-API-Key are common for hosted deployments. Without these
@@ -169,7 +258,14 @@ async fn handle_connection(
             }
 
             "GET" if accept_sse => {
-                // SSE stream: hold open and send periodic keep-alive comments
+                // SSE stream: hold open and send periodic keep-alive comments.
+                // Connections are served sequentially (the browser session is
+                // `!Send`), so holding this infinite keep-alive loop inline would
+                // never return to the accept loop and would wedge every later
+                // request. The keep-alive touches no browser state and the write
+                // half is `Send + 'static`, so detach the ping loop onto its own
+                // task and return — the accept loop stays free while the stream
+                // lives on independently.
                 let hdr = format!(
                     "HTTP/1.1 200 OK\r\n\
                     Content-Type: text/event-stream\r\n\
@@ -179,35 +275,31 @@ async fn handle_connection(
                     \r\n"
                 );
                 writer.write_all(hdr.as_bytes()).await?;
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                    if writer.write_all(b": ping\n\n").await.is_err() {
-                        break;
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                        if writer.write_all(b": ping\n\n").await.is_err() {
+                            break;
+                        }
+                        let _ = writer.flush().await;
                     }
-                    let _ = writer.flush().await;
-                }
-                break;
+                });
+                return Ok(());
             }
 
             "POST" => {
-                let len = match content_length {
-                    Some(n) => n,
-                    None => {
+                let body = match body {
+                    RequestBody::MissingLength => {
                         respond(&mut writer, 400, b"{\"error\":\"missing Content-Length\"}").await?;
                         break;
                     }
+                    RequestBody::TooLarge => {
+                        respond(&mut writer, 413, b"{\"error\":\"payload too large\"}").await?;
+                        break;
+                    }
+                    RequestBody::Read(body) => body,
+                    RequestBody::NotRead => unreachable!("valid MCP POST body was not read"),
                 };
-
-                // Reject oversized bodies BEFORE allocating: `vec![0u8; len]`
-                // commits `len` bytes up front, so an attacker-chosen
-                // Content-Length would otherwise OOM the process (DoS).
-                if len > MAX_BODY_BYTES {
-                    respond(&mut writer, 413, b"{\"error\":\"payload too large\"}").await?;
-                    break;
-                }
-
-                let mut body = vec![0u8; len];
-                reader.read_exact(&mut body).await?;
 
                 let response = process_body(&body, state).await;
                 let bytes = serde_json::to_vec(&response)?;
@@ -296,7 +388,12 @@ async fn respond(writer: &mut (impl AsyncWriteExt + Unpin), status: u16, body: &
 
 #[cfg(test)]
 mod mcp_hardening_tests {
-    use super::{origin_allowed, MAX_BODY_BYTES};
+    use super::{
+        origin_allowed, read_request_with_timeout, MAX_BODY_BYTES,
+        REQUEST_READ_TIMEOUT,
+    };
+    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::time::Duration;
 
     #[test]
     fn no_allowlist_is_permissive() {
@@ -319,5 +416,47 @@ mod mcp_hardening_tests {
         // Far above a real JSON-RPC tool call, far below an OOM-inducing value.
         assert!(MAX_BODY_BYTES >= 1 << 20);
         assert!(MAX_BODY_BYTES <= 64 << 20);
+    }
+
+    #[test]
+    fn request_read_timeout_is_generous_but_bounded() {
+        assert!(REQUEST_READ_TIMEOUT >= Duration::from_secs(10));
+        assert!(REQUEST_READ_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn stalled_request_line_hits_deadline() {
+        let (_client, server) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(server);
+        let err = match read_request_with_timeout(&mut reader, None, Duration::from_millis(20))
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("stalled request line should time out"),
+        };
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn stalled_request_body_hits_deadline() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client
+            .write_all(
+                b"POST /mcp HTTP/1.1\r\n\
+                  Content-Length: 8\r\n\
+                  \r\n\
+                  {}",
+            )
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(server);
+        let err = match read_request_with_timeout(&mut reader, None, Duration::from_millis(20))
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("stalled request body should time out"),
+        };
+        assert!(err.to_string().contains("timed out"));
     }
 }

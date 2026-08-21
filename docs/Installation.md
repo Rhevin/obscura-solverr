@@ -48,7 +48,10 @@ yay -S obscura-browser
 docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 ```
 
-Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc`, ~57 MB compressed.
+Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc`, with no shell or package manager in the runtime image.
+
+Official archives and the Docker image include the rendering engine. Source
+builders must pass `--features render`; see [Build from source](Build-from-source.md).
 
 ## From source
 
@@ -59,13 +62,18 @@ See [Build from source](Build-from-source.md).
 - `obscura`: CLI and CDP server.
 - `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
 
+Archive suffixes identify the feature set: no suffix includes rendering,
+`-stealth` includes rendering and stealth, `-no-render` includes neither, and
+`-no-render-stealth` includes stealth without rendering.
+
 ## Smoke test
 
 ```bash
 ./obscura fetch https://example.com --eval "document.title"
+./obscura fetch https://example.com --screenshot smoke.png
 ```
 
-Expected output: `"Example Domain"`.
+Expected output: `"Example Domain"`, followed by a nonempty PNG at `smoke.png`.
 
 ## Troubleshooting
 

@@ -2,6 +2,8 @@
 name = "obscura-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "obscura"
@@ -19,6 +21,7 @@ stealth = [
     "obscura-mcp/stealth",
     "obscura-solverr/stealth",
 ]
+render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
 
 [dependencies]
 obscura-browser = { workspace = true }
@@ -36,3 +39,6 @@ anyhow = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

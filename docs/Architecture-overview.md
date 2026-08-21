@@ -1,4 +1,4 @@
-Obscura is a workspace of eight crates.
+Obscura is a workspace of nine crates.
 
 ```
 obscura-cli       CLI entry point. fetch, serve, scrape, mcp.
@@ -8,6 +8,7 @@ obscura-js        V8 runtime via deno_core. bootstrap.js + Rust ops.
 obscura-dom       DOM tree implementation.
 obscura-net       HTTP client, stealth client, cookie jar, robots cache, tracker blocklist.
 obscura-mcp       Model Context Protocol server.
+obscura-render    CSS cascade, retained layout, text shaping, and CPU paint.
 obscura           Embeddable Rust library API (Browser, Page, Element, CookieStore).
 ```
 
@@ -41,6 +42,20 @@ obscura-browser/page.rs         navigate_with_wait
 
 The dispatcher emits CDP events (`Network.requestWillBeSent`, `Page.frameNavigated`, `Page.lifecycleEvent`) back to the client through the same WebSocket.
 
+## Rendering flow
+
+`obscura-render` consumes the shared DOM and computed style state. Taffy
+provides the flex/grid foundation; Obscura adds browser formatting behavior,
+text shaping, intrinsic replaced-element sizing, retained geometry, scrolling,
+and CPU-backed paint. `obscura-js` exposes renderer-owned geometry to DOM APIs,
+`obscura-browser` prepares resources and owns capture, and `obscura-cdp` maps
+screenshots, screencast frames, and raster PDF output onto CDP.
+
+Layout is retained between captures and invalidated by relevant DOM, style,
+viewport, scroll, animation, font, and resource changes. The same geometry
+therefore drives browser APIs and paint instead of maintaining separate
+measurement and screenshot models.
+
 ## Single V8 isolate
 
 All pages in a process share one V8 isolate. The isolate is single-threaded by design.
@@ -58,7 +73,7 @@ This is why `Target.createTarget` from many concurrent clients works: each `newP
 
 ## Robustness
 
-One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot hold the V8 lock and wedge other sessions (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module loads are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
+One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. The complete script phase is bounded by `OBSCURA_SCRIPT_DEADLINE_MS`; enhancement modules have a shorter per-module graph-loading/evaluation budget controlled by `OBSCURA_MODULE_BUDGET_MS`, while modules mounting an empty SPA shell receive the full script deadline. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot hold the V8 lock and wedge other sessions (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module network requests are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
 
 ## JS bridge
 

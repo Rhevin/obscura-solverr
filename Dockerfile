@@ -17,17 +17,20 @@ WORKDIR /build
 
 # Cache dependency compilation by copying manifests first
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/obscura-dom/Cargo.toml       crates/obscura-dom/Cargo.toml
 COPY crates/obscura-net/Cargo.toml       crates/obscura-net/Cargo.toml
 COPY crates/obscura-browser/Cargo.toml   crates/obscura-browser/Cargo.toml
 COPY crates/obscura-cdp/Cargo.toml       crates/obscura-cdp/Cargo.toml
 COPY crates/obscura-js/Cargo.toml        crates/obscura-js/Cargo.toml
 COPY crates/obscura-mcp/Cargo.toml       crates/obscura-mcp/Cargo.toml
+COPY crates/obscura-render/Cargo.toml    crates/obscura-render/Cargo.toml
 COPY crates/obscura-solverr/Cargo.toml crates/obscura-solverr/Cargo.toml
 COPY crates/obscura-cli/Cargo.toml       crates/obscura-cli/Cargo.toml
+COPY crates/obscura/Cargo.toml           crates/obscura/Cargo.toml
 
 # Create stub src files so cargo can resolve the dependency graph
-RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js obscura-mcp obscura-solverr; do \
+RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js obscura-mcp obscura-render obscura-solverr obscura; do \
         mkdir -p crates/$crate/src && echo "// stub" > crates/$crate/src/lib.rs; \
     done && \
     mkdir -p crates/obscura-cli/src && \
@@ -37,7 +40,7 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --bin obscura --bin obscura-worker --features stealth 2>/dev/null || true
+    cargo build --release --bin obscura --bin obscura-worker --features render,stealth 2>/dev/null || true
 
 ARG OBSCURA_VERSION
 
@@ -47,7 +50,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
-    touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker --features stealth && \
+    touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker --features render,stealth && \
     cp /build/target/release/obscura /build/target/release/obscura-worker /tmp/
 
 # ---

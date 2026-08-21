@@ -1,7 +1,78 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 const OBSCURA: &str = env!("CARGO_BIN_EXE_obscura");
+const TEST_PAGE: &str = r#"<!doctype html><html><head><title>Example Domain</title></head>
+<body><h1>Example Domain</h1><p>Deterministic local MCP fixture.</p>
+<a href="/more">More information...</a></body></html>"#;
+
+/// A loopback fixture keeps protocol tests independent of public-site bot
+/// policy, DNS, and content changes. The previous example.com dependency can
+/// return a Cloudflare block page, which tests the runner's egress reputation
+/// rather than Obscura navigation, snapshots, or evaluation.
+struct TestPageServer {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TestPageServer {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local fixture");
+        let addr = listener.local_addr().expect("local fixture address");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking local fixture");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            TEST_PAGE.len(),
+                            TEST_PAGE
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+}
+
+impl Drop for TestPageServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 // ── minimal MCP client ────────────────────────────────────────────────────────
 
@@ -16,6 +87,7 @@ impl McpClient {
     fn spawn() -> Self {
         let mut child = Command::new(OBSCURA)
             .args(["mcp"])
+            .env("OBSCURA_ALLOW_PRIVATE_NETWORK", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -194,12 +266,13 @@ fn test_notifications_are_silent() {
 
 #[test]
 fn test_navigate_and_snapshot() {
+    let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
 
-    let nav = c.tool("browser_navigate", serde_json::json!({"url": "https://example.com"}));
+    let nav = c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
     assert!(nav["result"]["isError"].is_null(), "navigate failed: {nav}");
     let text = content_text(&nav);
-    assert!(text.contains("example.com"), "unexpected nav text: {text}");
+    assert!(text.contains("127.0.0.1"), "unexpected nav text: {text}");
 
     let snap = c.tool("browser_snapshot", serde_json::json!({}));
     assert!(snap["result"]["isError"].is_null(), "snapshot failed: {snap}");
@@ -210,8 +283,9 @@ fn test_navigate_and_snapshot() {
 
 #[test]
 fn test_evaluate() {
+    let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": "https://example.com"}));
+    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
 
     let resp = c.tool(
         "browser_evaluate",
@@ -223,8 +297,9 @@ fn test_evaluate() {
 
 #[test]
 fn test_evaluate_math() {
+    let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": "https://example.com"}));
+    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
 
     let resp = c.tool(
         "browser_evaluate",
@@ -237,8 +312,9 @@ fn test_evaluate_math() {
 
 #[test]
 fn test_wait_for_selector() {
+    let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": "https://example.com"}));
+    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
 
     let resp = c.tool(
         "browser_wait_for",
@@ -250,8 +326,9 @@ fn test_wait_for_selector() {
 
 #[test]
 fn test_wait_for_timeout() {
+    let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": "https://example.com"}));
+    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
 
     let resp = c.tool(
         "browser_wait_for",
@@ -277,21 +354,23 @@ fn test_unknown_tool_returns_error() {
 
 #[test]
 fn test_network_requests() {
+    let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": "https://example.com"}));
+    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
 
     let resp = c.tool("browser_network_requests", serde_json::json!({}));
     let text = content_text(&resp);
     assert!(
-        text.contains("example.com") || text.contains("No network"),
+        text.contains("127.0.0.1") || text.contains("No network"),
         "unexpected: {text}"
     );
 }
 
 #[test]
 fn test_close_resets_state() {
+    let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": "https://example.com"}));
+    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
     let close = c.tool("browser_close", serde_json::json!({}));
     assert!(close["result"]["isError"].is_null());
 
