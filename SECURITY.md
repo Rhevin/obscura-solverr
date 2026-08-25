@@ -76,8 +76,8 @@ feature requests, but they will not be treated as security issues:
 ## Third-party dependencies
 
 Report vulnerabilities in third-party crates to their respective maintainers (or
-the [RustSec advisory database](https://rustsec.org/)). The workspace is gated
-by `cargo deny` via `deny.toml`. If a dependency advisory affects Obscura's own
+the [RustSec advisory database](https://rustsec.org/)). This fork does not run
+`cargo deny` in CI. If a dependency advisory affects Obscura's own
 behavior, let us know so we can pin or patch.
 
 ## Security model and operator responsibilities

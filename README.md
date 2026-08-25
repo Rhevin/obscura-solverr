@@ -203,6 +203,7 @@ This fork still includes the upstream Obscura CLI (`fetch`, `serve`, `scrape`, `
 | `crates/obscura-*` | Obscura browser engine (upstream) |
 | `compose.solverr.yaml` | Docker Compose for `:8191` |
 | `.github/workflows/publish-obscura-solverr.yml` | GHCR image on `v*` tags |
+| `.github/workflows/ci.yml` | Disabled stub. Do not restore upstream Obscura PR checks. |
 
 ## License
 
