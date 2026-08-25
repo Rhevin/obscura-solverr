@@ -1,4 +1,4 @@
-# FlareSolverr-compatible API on :8191 (drop-in for mangadl-go / Prowlarr / *arr).
+# FlareSolverr-compatible API on :8191 (drop-in for Prowlarr / *arr).
 #
 # Pull pre-built image from GHCR (published on git tag v*):
 #   docker compose -f compose.solverr.yaml pull

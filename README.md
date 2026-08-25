@@ -2,7 +2,7 @@
 
 FlareSolverr-compatible Cloudflare bypass API, powered by the [Obscura](https://github.com/h4ckf0r0day/obscura) headless browser.
 
-Drop-in replacement on port **8191** — same `POST /v1` contract as FlareSolverr. Works with [mangadl-go](https://github.com/Rhevin/mangadl-go), Prowlarr, Sonarr, Radarr, and any client that already speaks FlareSolverr.
+Drop-in replacement on port **8191** — same `POST /v1` contract as FlareSolverr. Works with Prowlarr, Sonarr, Radarr, and any client that already speaks FlareSolverr.
 
 ## Why this fork
 
@@ -176,20 +176,9 @@ See [docs/Environment-variables.md](docs/Environment-variables.md) and [docs/Con
 
 ## Integrations
 
-### mangadl-go
-
-Point FlareSolverr URL at ObscuraSolverr — no code changes:
-
-```env
-MANGADL_FLARESOLVERR_URL=http://obscura-solverr:8191
-MANGADL_USE_FLARESOLVERR=true
-```
-
-Or in Settings → FlareSolverr. Use the Docker service name when both run on the same compose network.
-
 ### Prowlarr / *arr
 
-Add indexer proxy type **FlareSolverr**, URL `http://obscura-solverr:8191`.
+Add indexer proxy type **FlareSolverr**, URL `http://obscura-solverr:8191`. Use the Docker / Apple Container service name when both run on the same compose network.
 
 ## Releases
 
