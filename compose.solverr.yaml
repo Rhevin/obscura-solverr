@@ -4,6 +4,10 @@
 #   docker compose -f compose.solverr.yaml pull
 #   docker compose -f compose.solverr.yaml up -d
 #
+# Apple Container + apple-compose (no compose `build:` support; build first):
+#   container build -t ghcr.io/rhevin/obscura-solverr:latest -f Dockerfile .
+#   apple-compose -f compose.solverr.yaml up
+#
 # Pin a release: image: ghcr.io/rhevin/obscura-solverr:1.0.0
 #
 # Build locally instead (needs BuildKit for cache mounts):

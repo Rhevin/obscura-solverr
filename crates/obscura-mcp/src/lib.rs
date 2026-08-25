@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+#[cfg(feature = "render")]
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_browser::{BrowserContext, Page};
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
@@ -143,6 +145,30 @@ impl BrowserState {
         self.tabs.remove(tab_id).is_some()
     }
 
+    fn has_active_page_runtime(&self) -> bool {
+        self.active_tab
+            .as_ref()
+            .and_then(|tab_id| self.tabs.get(tab_id))
+            .is_some_and(Page::has_js)
+    }
+
+    /// Advance the active page by one wake-driven browser task and immediately
+    /// consume any navigation that task queued. MCP owns its pages continuously,
+    /// so leaving either half for the next tool call strands timers, fetches,
+    /// and location/form/click navigations while the transport waits on stdin.
+    async fn advance_active_page_tasks(&mut self) -> Result<bool, String> {
+        let page = self.page_mut();
+        let reached_idle = page.run_autonomous_event_loop_turn().await?;
+        let navigated = page
+            .process_pending_navigation()
+            .await
+            .map_err(|error| error.to_string())?;
+        if navigated {
+            self.interactive_refs.clear();
+        }
+        Ok(reached_idle && !navigated)
+    }
+
     /// Resolve `ref=eN` to a CSS selector that uniquely targets the
     /// element. Snapshot writes `data-obscura-ref="eN"` onto every
     /// interactable, so the attribute survives across calls as long as
@@ -177,11 +203,32 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
     let mut writer = stdout;
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut runtime_pump_armed = false;
 
     loop {
         // MCP stdio transport: newline-delimited JSON (one message per line)
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = if runtime_pump_armed {
+            tokio::select! {
+                biased;
+                read = reader.read_line(&mut line) => Some(read?),
+                pump_result = state.advance_active_page_tasks() => {
+                    match pump_result {
+                        Ok(reached_idle) => runtime_pump_armed = !reached_idle,
+                        Err(error) => {
+                            runtime_pump_armed = false;
+                            eprintln!("MCP page task failed: {error}");
+                        }
+                    }
+                    None
+                }
+            }
+        } else {
+            Some(reader.read_line(&mut line).await?)
+        };
+        let Some(n) = n else {
+            continue;
+        };
         if n == 0 {
             return Ok(());
         }
@@ -203,6 +250,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
 
         let id = msg.id.clone().unwrap_or(Value::Null);
         let response = dispatch(&msg.method, id, &msg.params, &mut state).await;
+        runtime_pump_armed = state.has_active_page_runtime();
 
         let mut body = serde_json::to_string(&response)?;
         body.push('\n');
@@ -226,8 +274,8 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
 }
 
 fn handle_tools_list(id: Value) -> RpcResponse {
-    RpcResponse::ok(id, json!({
-        "tools": [
+    #[allow(unused_mut)]
+    let mut tools = json!([
             {
                 "name": "browser_navigate",
                 "description": "Navigate to a URL and wait for the page to load",
@@ -249,7 +297,10 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 "description": "Get the current page content as text (title, URL, and readable body text)",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "max_chars": { "type": "number", "minimum": 0, "description": "Truncate readable body text to this many characters (default: 4000)" }
+                    },
+                    "additionalProperties": false
                 }
             },
             {
@@ -598,8 +649,46 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                     "required": ["state"]
                 }
             }
-        ]
-    }))
+    ]).as_array().cloned().expect("MCP tool list must be an array");
+
+    #[cfg(feature = "render")]
+    {
+        tools.extend([
+            json!({
+                "name": "browser_screenshot",
+                "description": "Capture the current rendered viewport as a PNG image. Width and height default to the page's current CSS viewport.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 32768, "description": "Optional CSS-pixel capture width" },
+                        "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 32768, "description": "Optional CSS-pixel capture height" }
+                    },
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "browser_pdf",
+                "description": "Export the current rendered document as a paginated raster PDF using print media and bounded PDF defaults.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "landscape": { "type": "boolean" },
+                        "print_background": { "type": "boolean" },
+                        "scale": { "type": "number", "minimum": 0.1, "maximum": 2.0 },
+                        "paper_width": { "type": "number", "exclusiveMinimum": 0, "maximum": 200, "description": "Paper width in inches" },
+                        "paper_height": { "type": "number", "exclusiveMinimum": 0, "maximum": 200, "description": "Paper height in inches" },
+                        "margin_top": { "type": "number", "minimum": 0, "description": "Top margin in inches" },
+                        "margin_bottom": { "type": "number", "minimum": 0, "description": "Bottom margin in inches" },
+                        "margin_left": { "type": "number", "minimum": 0, "description": "Left margin in inches" },
+                        "margin_right": { "type": "number", "minimum": 0, "description": "Right margin in inches" }
+                    },
+                    "additionalProperties": false
+                }
+            }),
+        ]);
+    }
+
+    RpcResponse::ok(id, json!({ "tools": tools }))
 }
 
 async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
@@ -608,6 +697,24 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         None => return RpcResponse::err(id, -32602, "Missing tool name"),
     };
     let args = params.get("arguments").unwrap_or(&Value::Null);
+
+    #[cfg(feature = "render")]
+    {
+        let media_result = match name {
+            "browser_screenshot" => Some(tool_screenshot(args, state).await),
+            "browser_pdf" => Some(tool_pdf(args, state).await),
+            _ => None,
+        };
+        if let Some(result) = media_result {
+            return match result {
+                Ok(content) => RpcResponse::ok(id, json!({ "content": [content] })),
+                Err(error) => RpcResponse::ok(id, json!({
+                    "content": [{ "type": "text", "text": format!("Error: {error}") }],
+                    "isError": true
+                })),
+            };
+        }
+    }
 
     let result = match name {
         "browser_navigate" => tool_navigate(args, state).await,
@@ -659,6 +766,104 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
             "isError": true
         })),
     }
+}
+
+#[cfg(feature = "render")]
+fn validate_tool_options(args: &Value, allowed: &[&str]) -> Result<(), String> {
+    if args.is_null() {
+        return Ok(());
+    }
+    let object = args.as_object().ok_or("tool arguments must be an object")?;
+    if let Some(name) = object.keys().find(|name| !allowed.contains(&name.as_str())) {
+        return Err(format!("unsupported option '{name}'"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "render")]
+fn optional_number(args: &Value, name: &str) -> Result<Option<f32>, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value.as_f64().ok_or_else(|| format!("'{name}' must be a number"))?;
+    if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+        return Err(format!("'{name}' must be a finite number"));
+    }
+    Ok(Some(value as f32))
+}
+
+#[cfg(feature = "render")]
+fn optional_bool(args: &Value, name: &str) -> Result<Option<bool>, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| format!("'{name}' must be a boolean"))
+}
+
+#[cfg(feature = "render")]
+fn validate_screenshot_viewport(viewport: (f32, f32)) -> Result<(), String> {
+    const MAX_DIMENSION: f32 = 32_768.0;
+    const MAX_PIXELS: f64 = (16 * 1024 * 1024) as f64;
+    let (width, height) = viewport;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0
+        || width > MAX_DIMENSION || height > MAX_DIMENSION
+    {
+        return Err("screenshot dimensions must be finite, positive, and at most 32768 CSS pixels".into());
+    }
+    if f64::from(width.ceil()) * f64::from(height.ceil()) > MAX_PIXELS {
+        return Err("screenshot dimensions exceed the 16-megapixel capture limit".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "render")]
+async fn tool_screenshot(args: &Value, state: &mut BrowserState) -> Result<Value, String> {
+    validate_tool_options(args, &["width", "height"])?;
+    let current = state.page_mut().viewport;
+    let viewport = (
+        optional_number(args, "width")?.unwrap_or(current.0),
+        optional_number(args, "height")?.unwrap_or(current.1),
+    );
+    validate_screenshot_viewport(viewport)?;
+
+    let page = state.page_mut();
+    let _ = page.prepare_screenshot_resources(1_000).await;
+    let png = page.screenshot(viewport).ok_or("the current page has no renderable viewport")?;
+    Ok(json!({
+        "type": "image",
+        "data": BASE64.encode(png),
+        "mimeType": "image/png"
+    }))
+}
+
+#[cfg(feature = "render")]
+async fn tool_pdf(args: &Value, state: &mut BrowserState) -> Result<Value, String> {
+    validate_tool_options(args, &[
+        "landscape", "print_background", "scale", "paper_width", "paper_height",
+        "margin_top", "margin_bottom", "margin_left", "margin_right",
+    ])?;
+    let mut options = obscura_browser::RasterPdfOptions::default();
+    if let Some(value) = optional_bool(args, "landscape")? { options.landscape = value; }
+    if let Some(value) = optional_bool(args, "print_background")? { options.print_background = value; }
+    if let Some(value) = optional_number(args, "scale")? { options.scale = value; }
+    if let Some(value) = optional_number(args, "paper_width")? { options.paper_width_in = value; }
+    if let Some(value) = optional_number(args, "paper_height")? { options.paper_height_in = value; }
+    if let Some(value) = optional_number(args, "margin_top")? { options.margin_top_in = value; }
+    if let Some(value) = optional_number(args, "margin_bottom")? { options.margin_bottom_in = value; }
+    if let Some(value) = optional_number(args, "margin_left")? { options.margin_left_in = value; }
+    if let Some(value) = optional_number(args, "margin_right")? { options.margin_right_in = value; }
+
+    let page = state.page_mut();
+    let _ = page.prepare_screenshot_resources(1_000).await;
+    let pdf = page.raster_pdf(options).map_err(|error| error.to_string())?;
+    Ok(json!({
+        "type": "resource",
+        "resource": {
+            "uri": "obscura://capture/current-page.pdf",
+            "mimeType": "application/pdf",
+            "blob": BASE64.encode(pdf)
+        }
+    }))
 }
 
 /// Resolve a tool call's element target from either `ref` (preferred) or
@@ -770,9 +975,9 @@ fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
         r#"(function(){{
             var el = document.querySelector({sel});
             if (!el) return "error:element not found";
-            el.value = {val};
-            el.dispatchEvent(new Event("input", {{bubbles:true}}));
-            el.dispatchEvent(new Event("change", {{bubbles:true}}));
+            globalThis.__obscura_setFieldValue(el, "value", {val});
+            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
+            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", {{bubbles:true}})));
             return "ok";
         }})()"#,
         sel = serde_json::to_string(&selector).unwrap(),
@@ -796,8 +1001,8 @@ fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
         r#"(function(){{
             var el = document.querySelector({sel});
             if (!el) return "error:element not found";
-            el.value = (el.value || "") + {txt};
-            el.dispatchEvent(new Event("input", {{bubbles:true}}));
+            globalThis.__obscura_setFieldValue(el, "value", (el.value || "") + {txt});
+            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
             return "ok";
         }})()"#,
         sel = serde_json::to_string(&selector).unwrap(),
@@ -903,7 +1108,13 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
             return Err(format!("Timeout waiting for '{selector}'"));
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(tick_ms)).await;
+        let tick = tokio::time::Duration::from_millis(tick_ms);
+        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {}
+        }
         if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
@@ -1141,7 +1352,7 @@ fn tool_get_cookies(args: &Value, state: &BrowserState) -> Result<String, String
     let domain_filter = args.get("domain").and_then(Value::as_str);
     let cookies = state.context.cookie_jar.get_all_cookies();
     let lines: Vec<String> = cookies.iter()
-        .filter(|c| domain_filter.is_none_or(|d| c.domain == d || c.domain.trim_start_matches('.') == d))
+        .filter(|c| domain_filter.is_none_or(|d| c.domain == obscura_net::canonical_domain(d)))
         .map(|c| serde_json::to_string(&json!({
             "name": c.name,
             "value": c.value,
@@ -1207,7 +1418,13 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("Timeout waiting for text {needle:?}"));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(tick_ms)).await;
+        let tick = tokio::time::Duration::from_millis(tick_ms);
+        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {}
+        }
         if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
@@ -1298,15 +1515,17 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
             "check" => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
-                el.checked = true;
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                globalThis.__obscura_setFieldValue(el, 'checked', true);
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap()),
             "uncheck" => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
-                el.checked = false;
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                globalThis.__obscura_setFieldValue(el, 'checked', false);
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap()),
             "select" => format!(r#"(function(){{
@@ -1323,15 +1542,16 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
                     }}
                 }}
                 if (!matched) return "error:no matching option";
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
             _ => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
-                el.value = {val};
-                el.dispatchEvent(new Event('input', {{bubbles:true}}));
-                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                globalThis.__obscura_setFieldValue(el, 'value', {val});
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
         };
@@ -1768,4 +1988,242 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
         }
     }
     Ok(format!("Restored {applied} state entries."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed_tools() -> Vec<Value> {
+        handle_tools_list(json!(1)).result.expect("tools/list result")
+            .get("tools").and_then(Value::as_array).cloned().expect("tools array")
+    }
+
+    #[test]
+    fn tool_schemas_expose_snapshot_limit_without_nested_properties() {
+        let tools = listed_tools();
+        let snapshot = tools.iter().find(|tool| tool["name"] == "browser_snapshot")
+            .expect("browser_snapshot tool");
+        assert_eq!(snapshot["inputSchema"]["properties"]["max_chars"]["type"], "number");
+        for tool in tools {
+            assert!(
+                tool["inputSchema"]["properties"].get("properties").is_none(),
+                "{} has a nested duplicate properties object", tool["name"]
+            );
+        }
+    }
+
+    #[cfg(not(feature = "render"))]
+    #[test]
+    fn render_tools_are_not_advertised_without_render_feature() {
+        let tools = listed_tools();
+        assert!(tools.iter().all(|tool| {
+            tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
+        }));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_tools_are_advertised_with_flat_schemas() {
+        let tools = listed_tools();
+        for name in ["browser_screenshot", "browser_pdf"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(tool["inputSchema"]["type"], "object");
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert!(tool["inputSchema"]["properties"].is_object());
+            assert!(tool["inputSchema"]["properties"].get("properties").is_none());
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_tool_calls_return_mcp_binary_content_and_reject_bad_options() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(
+            "data:text/html,<html style='margin:0'><body style='margin:0;background:red'><div style='width:64px;height:48px'></div></body></html>",
+        ).await.expect("render test page should navigate");
+        state.page_mut().set_viewport((64.0, 48.0));
+
+        let screenshot = handle_tool_call(
+            json!(1), &json!({ "name": "browser_screenshot", "arguments": {} }), &mut state,
+        ).await.result.expect("screenshot response");
+        let image = &screenshot["content"][0];
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["mimeType"], "image/png");
+        let png = BASE64.decode(image["data"].as_str().expect("PNG base64"))
+            .expect("valid PNG base64");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let pdf = handle_tool_call(
+            json!(2),
+            &json!({ "name": "browser_pdf", "arguments": { "print_background": true } }),
+            &mut state,
+        ).await.result.expect("PDF response");
+        let resource = &pdf["content"][0];
+        assert_eq!(resource["type"], "resource");
+        assert_eq!(resource["resource"]["mimeType"], "application/pdf");
+        let bytes = BASE64.decode(resource["resource"]["blob"].as_str().expect("PDF base64"))
+            .expect("valid PDF base64");
+        assert!(bytes.starts_with(b"%PDF-"));
+
+        let invalid_screenshot = handle_tool_call(
+            json!(3),
+            &json!({ "name": "browser_screenshot", "arguments": { "width": 0 } }),
+            &mut state,
+        ).await.result.expect("invalid screenshot response");
+        assert_eq!(invalid_screenshot["isError"], true);
+
+        let invalid_pdf = handle_tool_call(
+            json!(4),
+            &json!({ "name": "browser_pdf", "arguments": { "scale": 3 } }),
+            &mut state,
+        ).await.result.expect("invalid PDF response");
+        assert_eq!(invalid_pdf["isError"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_tools_notify_controlled_input_tracker() {
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate("data:text/html,<div id=root><input id=field></div>")
+            .await
+            .expect("test page should navigate");
+
+        state.page_mut().evaluate(
+            r#"(function () {
+                var root = document.getElementById('root');
+                var input = document.getElementById('field');
+                var descriptor = Object.getOwnPropertyDescriptor(input.constructor.prototype, 'value');
+                var tracked = String(input.value);
+                Object.defineProperty(input, 'value', {
+                    configurable: true,
+                    get: function () { return descriptor.get.call(this); },
+                    set: function (value) {
+                        tracked = String(value);
+                        descriptor.set.call(this, value);
+                    }
+                });
+                window.__controlledState = '';
+                window.__controlledUpdates = 0;
+                window.__lastInputTarget = '';
+                window.__lastInputTrusted = false;
+                root.addEventListener('input', function (event) {
+                    window.__lastInputTarget = event.target.id;
+                    window.__lastInputTrusted = event.isTrusted;
+                    var next = String(event.target.value);
+                    if (next !== tracked) {
+                        tracked = next;
+                        window.__controlledState = next;
+                        window.__controlledUpdates++;
+                    }
+                });
+            })()"#,
+        );
+
+        tool_fill(
+            &json!({ "selector": "#field", "value": "filled" }),
+            &mut state,
+        )
+        .expect("browser_fill should succeed");
+        tool_type(
+            &json!({ "selector": "#field", "text": "-typed" }),
+            &mut state,
+        )
+        .expect("browser_type should succeed");
+        tool_fill_form(
+            &json!({
+                "fields": [{ "selector": "#field", "value": "form-filled" }]
+            }),
+            &mut state,
+        )
+        .expect("browser_fill_form should succeed");
+
+        let actual = state.page_mut().evaluate(
+            r#"JSON.stringify({
+                domValue: document.getElementById('field').value,
+                controlledState: window.__controlledState,
+                controlledUpdates: window.__controlledUpdates,
+                lastInputTarget: window.__lastInputTarget,
+                lastInputTrusted: window.__lastInputTrusted
+            })"#,
+        );
+        assert_eq!(
+            actual,
+            json!(r#"{"domValue":"form-filled","controlledState":"form-filled","controlledUpdates":3,"lastInputTarget":"field","lastInputTrusted":true}"#),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_check_and_select_use_native_setter_and_trusted_events() {
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(
+                "data:text/html,<div id=root><input id=box type=checkbox>\
+                 <select id=sel><option value=a>a</option><option value=b>b</option></select></div>",
+            )
+            .await
+            .expect("test page should navigate");
+
+        // Install a React-style tracker on the checkbox's `checked`, redefined on
+        // the instance. A direct `el.checked = true` runs this wrapper in lockstep,
+        // so a change handler comparing target.checked to the tracked value sees no
+        // change and never commits. Writing through the prototype setter (what
+        // __obscura_setFieldValue does) leaves the tracker stale so the edit
+        // registers. Also record whether the dispatched change is trusted.
+        state.page_mut().evaluate(
+            r#"(function () {
+                var box = document.getElementById('box');
+                var root = document.getElementById('root');
+                var d = Object.getOwnPropertyDescriptor(box.constructor.prototype, 'checked');
+                var tracked = box.checked;
+                Object.defineProperty(box, 'checked', {
+                    configurable: true,
+                    get: function () { return d.get.call(this); },
+                    set: function (v) { tracked = !!v; d.set.call(this, v); }
+                });
+                window.__checkedCommitted = false;
+                window.__checkTrusted = false;
+                window.__selectTrusted = false;
+                root.addEventListener('change', function (event) {
+                    if (event.target.id === 'box') {
+                        window.__checkTrusted = event.isTrusted;
+                        if (event.target.checked !== tracked) {
+                            tracked = event.target.checked;
+                            window.__checkedCommitted = true;
+                        }
+                    } else if (event.target.id === 'sel') {
+                        window.__selectTrusted = event.isTrusted;
+                    }
+                });
+            })()"#,
+        );
+
+        tool_fill_form(
+            &json!({
+                "fields": [
+                    { "selector": "#box", "type": "check" },
+                    { "selector": "#sel", "type": "select", "value": "b" }
+                ]
+            }),
+            &mut state,
+        )
+        .expect("browser_fill_form should succeed");
+
+        let actual = state.page_mut().evaluate(
+            r#"JSON.stringify({
+                domChecked: document.getElementById('box').checked,
+                checkedCommitted: window.__checkedCommitted,
+                checkTrusted: window.__checkTrusted,
+                selValue: document.getElementById('sel').value,
+                selectTrusted: window.__selectTrusted
+            })"#,
+        );
+        assert_eq!(
+            actual,
+            json!(r#"{"domChecked":true,"checkedCommitted":true,"checkTrusted":true,"selValue":"b","selectTrusted":true}"#),
+        );
+    }
 }

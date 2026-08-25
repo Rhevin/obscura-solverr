@@ -45,6 +45,16 @@ First build compiles V8 + stealth TLS (~5–10 min). Needs Docker BuildKit.
 docker compose -f compose.solverr.yaml up -d --build
 ```
 
+### Apple Container + apple-compose
+
+[apple-compose](https://github.com/Rhevin/apple-compose) does not run compose `build:`. Build the image with [Apple `container`](https://github.com/apple/container), then start the stack:
+
+```bash
+container system start
+container build -t ghcr.io/rhevin/obscura-solverr:latest -f Dockerfile .
+apple-compose -f compose.solverr.yaml up
+```
+
 ### Binary
 
 ```bash

@@ -15,11 +15,15 @@ What `--stealth` changes:
 - Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
 - Bundles webpki roots instead of relying on the system store.
 
-Requires a build that includes the stealth feature. Release binaries on the Releases page include it. To build it yourself:
+Requires a build that includes the stealth feature. Use a `-stealth` archive
+with rendering or a `-no-render-stealth` archive without it. To build the
+rendering variant yourself:
 
 ```bash
-cargo build --release --features stealth
+cargo build --release -p obscura-cli --bins --features render,stealth
 ```
+
+Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-features --features stealth`.
 
 ## What stealth handles
 
