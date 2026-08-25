@@ -153,6 +153,46 @@ impl BrowserContext {
         Self::with_options(id, proxy_url, false)
     }
 
+    /// Create a context with the same browser configuration but independent
+    /// mutable network state. Persistent copies start with the template's
+    /// current cookies; incognito copies start empty and never write to the
+    /// template's storage directory.
+    pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
+        let cookie_jar = Arc::new(CookieJar::new());
+        if persistent {
+            cookie_jar.set_cookies_from_cdp(self.cookie_jar.get_all_cookies());
+        }
+
+        let mut client = ObscuraHttpClient::with_full_options(
+            cookie_jar.clone(),
+            self.proxy_url.as_deref(),
+            self.allow_private_network,
+        );
+        if self.stealth {
+            client.block_trackers = true;
+        }
+        if let Ok(mut guard) = client.user_agent.try_write() {
+            *guard = self.user_agent.clone();
+        }
+
+        BrowserContext {
+            id,
+            cookie_jar,
+            http_client: Arc::new(client),
+            user_agent: self.user_agent.clone(),
+            platform: self.platform.clone(),
+            ua_platform: self.ua_platform.clone(),
+            ua_platform_version: self.ua_platform_version.clone(),
+            proxy_url: self.proxy_url.clone(),
+            robots_cache: Arc::new(RobotsCache::new()),
+            obey_robots: self.obey_robots,
+            stealth: self.stealth,
+            allow_file_access: self.allow_file_access,
+            storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
+            allow_private_network: self.allow_private_network,
+        }
+    }
+
     /// Persist cookies to disk if storage_dir is configured.
     /// Called during graceful shutdown.
     pub fn save_cookies(&self) {
@@ -203,5 +243,27 @@ mod tests {
     async fn with_options_keeps_default_user_agent() {
         let ctx = BrowserContext::with_options("test".to_string(), None, false);
         assert!(ctx.user_agent.contains("Chrome"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_copy_does_not_share_mutable_network_state() {
+        let source = BrowserContext::with_full_options(
+            "source".to_string(),
+            None,
+            false,
+            Some("Template-UA/1.0".to_string()),
+        );
+        source.cookie_jar.set_cookie("sid=source", &url::Url::parse("https://example.com").unwrap());
+
+        let persistent = source.isolated_copy("persistent".to_string(), true);
+        let incognito = source.isolated_copy("incognito".to_string(), false);
+
+        assert_eq!(persistent.cookie_jar.get_all_cookies().len(), 1);
+        assert!(incognito.cookie_jar.get_all_cookies().is_empty());
+        persistent.cookie_jar.clear();
+        persistent.http_client.set_user_agent("Changed-UA/2.0").await;
+
+        assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
+        assert_eq!(source.http_client.user_agent.read().await.as_str(), "Template-UA/1.0");
     }
 }

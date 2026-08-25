@@ -24,7 +24,7 @@ Load a URL and print its content or an evaluated expression.
     --dump <FORMAT>          html | text | links | markdown | original | assets | cookies
                              (default html)
     --selector <CSS>         Narrow output to a CSS selector
-    --wait <SECONDS>         Extra wait after settle (default 5)
+    --wait <SECONDS>         Fixed post-load delay; omitted uses adaptive settle (5s cap)
     --timeout <SECONDS>      Navigation timeout (default 30)
     --wait-until <LEVEL>     domcontentloaded | load | networkidle2 | networkidle0
                              (default load)
@@ -33,9 +33,19 @@ Load a URL and print its content or an evaluated expression.
     --stealth                Consistent browser fingerprint + tracker blocking (global)
 -e, --eval <JS>              Evaluate JS, print the result as JSON
 -o, --output <FILE>          Write to a file instead of stdout
+-s, --screenshot <FILE>      Capture the settled page as PNG (single URL)
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable verbose logging
 ```
+
+`--screenshot` requires a render-enabled build. It uses a 1280×720 viewport by
+default and may be combined with `--eval`; the expression runs before capture,
+which is useful for scrolling or preparing page state. It is not available in
+`--file` batch mode.
+
+When `--wait` is omitted, Obscura drives timers and async work until the page
+becomes quiescent, with a five-second ceiling. Supplying `--wait N` instead
+requests a fixed `N`-second delay. `--timeout` separately bounds navigation.
 
 `--dump` values:
 
@@ -113,3 +123,6 @@ Run obscura as an MCP server.
 `--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only; set `0.0.0.0` to bind all interfaces (for example a Docker Compose sidecar) and pair it with `OBSCURA_MCP_ALLOWED_ORIGINS`.
 
 Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
+
+Render-enabled builds add `browser_screenshot` and `browser_pdf` to the MCP
+tool list. Streaming screencasts are available through CDP rather than MCP.

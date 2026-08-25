@@ -3,21 +3,25 @@
 ### Rust unit and integration
 
 ```bash
-cargo test --release
+cargo nextest run --release --features render --no-fail-fast
 ```
 
 Crate-scoped:
 
 ```bash
-cargo test -p obscura-cdp
-cargo test -p obscura-browser
+cargo nextest run --release --features render -p obscura-cdp
+cargo nextest run --release --features render -p obscura-browser
 ```
 
 By name:
 
 ```bash
-cargo test runtime_click_submit_prevent_default
+cargo nextest run --release --features render runtime_click_submit_prevent_default
 ```
+
+Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
+because the engine owns one V8 isolate per process. Render tests must run in
+release mode; debug builds are not a fidelity or performance gate.
 
 ### CDP parity tests
 
@@ -100,12 +104,31 @@ The integration suite in `tests/test_all.py` is the fastest path from a one-line
 
 For Puppeteer / Playwright bug reports, the user's repro script usually drops straight in. Save it as `tests/repro_<issue>.js`, run with `node`, fix until it passes.
 
+### Rendering regressions
+
+Start with the committed deterministic fixtures, then use the representative
+real-site suite at both the top and bottom of pages:
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+OBSCURA_BIN=./target/release/obscura render-repros/run.sh "$RUN_ROOT/fixtures"
+OBSCURA_BIN=./target/release/obscura render-repros/representative-suite/run.sh "$RUN_ROOT/top"
+OBSCURA_BIN=./target/release/obscura render-repros/representative-suite/run.sh "$RUN_ROOT/bottom" bottom
+```
+
+Set `BASELINE_BIN` or `CHROMIUM_BIN` when producing paired captures. Keep the
+viewport, user agent, settle policy, scroll position, animation sample, and
+capture boundary identical. A pixel-distance score is a regression tripwire,
+not a verdict: verify both engines succeeded and produced nonblank output,
+then inspect missing resources, geometry, structural edges, and a reduced
+fixture. Do not add hostname-specific render branches.
+
 ## Profiling
 
 CPU with `perf` and a flamegraph:
 
 ```bash
-cargo build --release
+cargo build --release --features render
 perf record -F 99 -g -- ./target/release/obscura fetch https://heavy-spa.example
 perf script | flamegraph.pl > flame.svg
 ```
@@ -119,7 +142,7 @@ heaptrack ./target/release/obscura serve
 Tokio task inspection:
 
 ```bash
-RUSTFLAGS="--cfg tokio_unstable" cargo build --release
+RUSTFLAGS="--cfg tokio_unstable" cargo build --release --features render
 ./target/release/obscura serve
 # in another shell
 tokio-console

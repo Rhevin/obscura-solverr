@@ -12,6 +12,11 @@ Obscura is an open-source headless browser engine written in Rust. It runs JavaS
 | Puppeteer   | Yes      | Yes             |
 | Playwright  | Yes      | Yes             |
 
+Rendering and stealth are both first-class capabilities. Release builds
+support screenshots, scroll-aware layout, activity-driven CDP screencasting,
+and raster PDF export; stealth builds retain all of those surfaces while adding
+the wreq/BoringSSL transport and browser-identity protections.
+
 ## Quickstart
 
 - [Installation](Installation.md)

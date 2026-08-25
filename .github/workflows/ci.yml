@@ -1,0 +1,20 @@
+# ObscuraSolverr does not run upstream Obscura PR policy, cargo-deny, or
+# obstacle-course jobs. Those are 90+ minute V8/nextest/benchmark checks for
+# the engine repo, not this FlareSolverr API fork.
+#
+# Keep this file disabled. On `git merge upstream/main`, resolve conflicts by
+# keeping this stub. Do not restore the upstream workflow.
+name: PR checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  skip:
+    name: Disabled
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo "Fork CI is .github/workflows/publish-obscura-solverr.yml on v* tags."

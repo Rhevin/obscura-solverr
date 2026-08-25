@@ -1,24 +1,23 @@
-# FlareSolverr-compatible API on :8191 (drop-in for mangadl-go / Prowlarr / *arr).
+# FlareSolverr-compatible API on :8191 (drop-in for Prowlarr / *arr).
 #
 # Pull pre-built image from GHCR (published on git tag v*):
 #   docker compose -f compose.solverr.yaml pull
 #   docker compose -f compose.solverr.yaml up -d
 #
+# Apple Container + apple-compose (no compose `build:` support; build first):
+#   container build -t ghcr.io/rhevin/obscura-solverr:latest -f Dockerfile .
+#   apple-compose -f compose.solverr.yaml up
+#
 # Pin a release: image: ghcr.io/rhevin/obscura-solverr:1.0.0
 #
-# Build locally instead (needs BuildKit for cache mounts):
-#   docker compose -f compose.solverr.yaml up -d --build
+# Build locally (apple-compose cannot use compose `build:`; tag must match `image:`):
+#   docker build -t ghcr.io/rhevin/obscura-solverr:latest --build-arg OBSCURA_VERSION=solverr .
 #
 name: obscura-solverr
 
 services:
   obscura-solverr:
     image: ghcr.io/rhevin/obscura-solverr:latest
-    container_name: obscura-solverr
-    build:
-      context: .
-      args:
-        OBSCURA_VERSION: solverr
     command:
       - solverr
       - --host
@@ -35,9 +34,7 @@ services:
       OBSCURA_NAV_TIMEOUT_MS: "130000"
       OBSCURA_FETCH_TIMEOUT_MS: "120000"
       RUST_LOG: obscura=info,obscura_solverr=info
-    restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: 768M
-          cpus: "1.0"

@@ -2,7 +2,7 @@
 
 FlareSolverr-compatible Cloudflare bypass API, powered by the [Obscura](https://github.com/h4ckf0r0day/obscura) headless browser.
 
-Drop-in replacement on port **8191** — same `POST /v1` contract as FlareSolverr. Works with [mangadl-go](https://github.com/Rhevin/mangadl-go), Prowlarr, Sonarr, Radarr, and any client that already speaks FlareSolverr.
+Drop-in replacement on port **8191** — same `POST /v1` contract as FlareSolverr. Works with Prowlarr, Sonarr, Radarr, and any client that already speaks FlareSolverr.
 
 ## Why this fork
 
@@ -42,7 +42,18 @@ Make the GHCR package **public** after the first release: GitHub → **Packages*
 First build compiles V8 + stealth TLS (~5–10 min). Needs Docker BuildKit.
 
 ```bash
-docker compose -f compose.solverr.yaml up -d --build
+docker build -t ghcr.io/rhevin/obscura-solverr:latest --build-arg OBSCURA_VERSION=solverr .
+docker compose -f compose.solverr.yaml up -d
+```
+
+### Apple Container + apple-compose
+
+[apple-compose](https://github.com/Rhevin/apple-compose) does not run compose `build:`. Build the image with [Apple `container`](https://github.com/apple/container), then start the stack:
+
+```bash
+container system start
+container build -t ghcr.io/rhevin/obscura-solverr:latest -f Dockerfile .
+apple-compose -f compose.solverr.yaml up
 ```
 
 ### Binary
@@ -88,7 +99,7 @@ docker stats obscura-solverr
 | Idle | ~0% | ~15 MiB |
 | CF solve | ~100% (one core) | spikes briefly, well under 768 MiB limit |
 
-Compose defaults cap the container at **768 MiB RAM** and **1 CPU**. Adjust in `compose.solverr.yaml` if needed.
+Compose defaults cap the container at **768 MiB RAM**. Adjust in `compose.solverr.yaml` if needed. Apple `container` rejects fractional `--cpus` (e.g. `1.00`), so the CPU cap is omitted there.
 
 ## API
 
@@ -165,20 +176,9 @@ See [docs/Environment-variables.md](docs/Environment-variables.md) and [docs/Con
 
 ## Integrations
 
-### mangadl-go
-
-Point FlareSolverr URL at ObscuraSolverr — no code changes:
-
-```env
-MANGADL_FLARESOLVERR_URL=http://obscura-solverr:8191
-MANGADL_USE_FLARESOLVERR=true
-```
-
-Or in Settings → FlareSolverr. Use the Docker service name when both run on the same compose network.
-
 ### Prowlarr / *arr
 
-Add indexer proxy type **FlareSolverr**, URL `http://obscura-solverr:8191`.
+Add indexer proxy type **FlareSolverr**, URL `http://obscura-solverr:8191`. Use the Docker / Apple Container service name when both run on the same compose network.
 
 ## Releases
 
@@ -203,6 +203,7 @@ This fork still includes the upstream Obscura CLI (`fetch`, `serve`, `scrape`, `
 | `crates/obscura-*` | Obscura browser engine (upstream) |
 | `compose.solverr.yaml` | Docker Compose for `:8191` |
 | `.github/workflows/publish-obscura-solverr.yml` | GHCR image on `v*` tags |
+| `.github/workflows/ci.yml` | Disabled stub. Do not restore upstream Obscura PR checks. |
 
 ## License
 
