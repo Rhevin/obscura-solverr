@@ -42,7 +42,8 @@ Make the GHCR package **public** after the first release: GitHub → **Packages*
 First build compiles V8 + stealth TLS (~5–10 min). Needs Docker BuildKit.
 
 ```bash
-docker compose -f compose.solverr.yaml up -d --build
+docker build -t ghcr.io/rhevin/obscura-solverr:latest --build-arg OBSCURA_VERSION=solverr .
+docker compose -f compose.solverr.yaml up -d
 ```
 
 ### Apple Container + apple-compose
@@ -98,7 +99,7 @@ docker stats obscura-solverr
 | Idle | ~0% | ~15 MiB |
 | CF solve | ~100% (one core) | spikes briefly, well under 768 MiB limit |
 
-Compose defaults cap the container at **768 MiB RAM** and **1 CPU**. Adjust in `compose.solverr.yaml` if needed.
+Compose defaults cap the container at **768 MiB RAM**. Adjust in `compose.solverr.yaml` if needed. Apple `container` rejects fractional `--cpus` (e.g. `1.00`), so the CPU cap is omitted there.
 
 ## API
 
