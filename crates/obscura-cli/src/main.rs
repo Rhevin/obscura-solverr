@@ -97,6 +97,11 @@ enum Command {
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
 
+        /// Recursively load TTF, TTC, OTF, and OTC files from this directory.
+        /// Repeat for multiple directories. Requires a render-enabled build.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
+
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
         #[arg(long)]
@@ -278,6 +283,30 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
     )
 }
 
+fn configure_font_directories(font_dirs: &[std::path::PathBuf]) -> anyhow::Result<()> {
+    if font_dirs.is_empty() {
+        return Ok(());
+    }
+    for directory in font_dirs {
+        if !directory.is_dir() {
+            anyhow::bail!(
+                "Font directory does not exist or is not a directory: {}",
+                directory.display()
+            );
+        }
+    }
+
+    #[cfg(feature = "render")]
+    {
+        if !obscura_js::configure_font_directories(font_dirs.to_vec()) {
+            anyhow::bail!("Font directories must be configured before the first render");
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "render"))]
+    anyhow::bail!("--font-dir requires a render-enabled build")
+}
+
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
 }
@@ -320,8 +349,23 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("obscura-main".to_string())
+        // V8 derives its stack guard from the current native thread. Deep but
+        // valid hostile documents can otherwise exhaust the platform's small
+        // default stack while the page realm is initialized. This reserves
+        // address space; pages are committed only as the stack is used.
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run_cli)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
@@ -386,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             allow_file_access,
             storage_dir,
+            font_dirs,
             quiet: _,
         }) => {
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
@@ -396,6 +441,7 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
+            configure_font_directories(&font_dirs)?;
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -405,6 +451,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(ref ua) = user_agent {
                 tracing::info!("User-Agent: {}", ua);
+            }
+            for directory in &font_dirs {
+                tracing::info!("Font dir: {}", directory.display());
             }
             if stealth {
                 #[cfg(feature = "stealth")]
@@ -417,7 +466,16 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(
+                    port,
+                    host,
+                    workers,
+                    proxy,
+                    stealth,
+                    user_agent,
+                    font_dirs,
+                )
+                .await?;
             } else {
                 obscura_cdp::start_with_serve_options_and_limit(
                     port,
@@ -577,17 +635,36 @@ async fn run_multi_worker_serve(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    font_dirs: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     let exe = std::env::current_exe()?;
+    // Claim the public port before starting children so another process cannot
+    // take it during worker startup.
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    // Internal worker ports are implementation details. Asking the OS for
+    // free ports avoids assuming that every port adjacent to the public one is
+    // available (or that `port + workers` cannot overflow).
+    let mut reservations = Vec::with_capacity(workers as usize);
+    for _ in 0..workers {
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let worker_port = reservation.local_addr()?.port();
+        reservations.push((worker_port, reservation));
+    }
     let mut children = Vec::new();
+    let mut worker_ports = Vec::with_capacity(workers as usize);
 
-    for i in 0..workers {
-        let worker_port = port + 1 + i;
+    for (index, (worker_port, reservation)) in reservations.into_iter().enumerate() {
+        drop(reservation);
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        // Workers receive the client-facing Host header through the TCP
+        // load balancer. Let their CDP security gate accept that public port
+        // while it continues to reject foreign hosts and browser origins.
+        cmd.env("OBSCURA_CDP_FORWARDED_HOST", &host);
+        cmd.env("OBSCURA_CDP_FORWARDED_PORT", port.to_string());
         if let Some(ref p) = proxy {
             // Pass the proxy (which may embed credentials) via the environment,
             // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
@@ -598,6 +675,9 @@ async fn run_multi_worker_serve(
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
         }
+        for directory in &font_dirs {
+            cmd.arg("--font-dir").arg(directory);
+        }
         if stealth {
             cmd.arg("--stealth");
         }
@@ -605,41 +685,86 @@ async fn run_multi_worker_serve(
         cmd.stderr(std::process::Stdio::null());
 
         let child = cmd.spawn()?;
-        tracing::info!("Worker {} on port {}", i + 1, worker_port);
+        tracing::info!("Worker {} on port {}", index + 1, worker_port);
         children.push(child);
+        worker_ports.push(worker_port);
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait only until every worker has bound its control port. The old fixed
+    // 500 ms sleep dominated multi-worker startup even when workers were ready
+    // in a few milliseconds.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    for (index, (child, &worker_port)) in children.iter_mut().zip(&worker_ports).enumerate() {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("worker {} exited during startup: {}", index + 1, status);
+            }
+            match TcpStream::connect(("127.0.0.1", worker_port)).await {
+                Ok(stream) => {
+                    drop(stream);
+                    break;
+                }
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                }
+                Err(error) => {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
 
-    // Bind the load balancer to the requested host, not hardcoded loopback.
+    // The load balancer is bound to the requested host, not hardcoded loopback.
     // With --host 0.0.0.0 (e.g. in Docker) the single-worker path already binds
     // all interfaces; the multi-worker balancer must too, or the mapped port is
     // refused from outside the container (issue #336). Workers stay on loopback
     // and are only reached by the balancer.
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!("Load balancer on {}:{}, {} workers", host, port, workers);
 
-    let mut next_worker: u16 = 0;
+    let mut next_worker = 0usize;
 
     loop {
         let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
+        if let Err(error) = client_stream.set_nodelay(true) {
+            tracing::warn!("client {} TCP_NODELAY failed: {}", peer_addr, error);
+        }
+        let worker_port = worker_ports[next_worker % worker_ports.len()];
         next_worker = next_worker.wrapping_add(1);
 
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
 
         let mut peek_buf = [0u8; 4];
-        client_stream.peek(&mut peek_buf).await?;
+        match client_stream.peek(&mut peek_buf).await {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                continue;
+            }
+        }
 
         if &peek_buf == b"GET " {
             let mut full_peek = [0u8; 256];
-            let n = client_stream.peek(&mut full_peek).await?;
+            let n = match client_stream.peek(&mut full_peek).await {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                    continue;
+                }
+            };
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
                 let worker_addr = format!("127.0.0.1:{}", worker_port);
                 match tokio::net::TcpStream::connect(&worker_addr).await {
                     Ok(mut worker_stream) => {
+                        if let Err(error) = worker_stream.set_nodelay(true) {
+                            tracing::warn!(
+                                "worker {} TCP_NODELAY failed: {}",
+                                worker_addr,
+                                error
+                            );
+                        }
                         tokio::spawn(async move {
                             let std_stream = match client_stream.into_std() {
                                 Ok(s) => s,
@@ -684,6 +809,10 @@ async fn run_multi_worker_serve(
         tokio::spawn(async move {
             match tokio::net::TcpStream::connect(&worker_addr).await {
                 Ok(mut worker_stream) => {
+                    if let Err(error) = worker_stream.set_nodelay(true) {
+                        tracing::warn!("worker {} TCP_NODELAY failed: {}", worker_addr, error);
+                        return;
+                    }
                     let mut client = client_stream;
                     let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
                 }
@@ -1147,9 +1276,14 @@ async fn fetch_original_response(
     if stealth && url.scheme() != "file" {
         #[cfg(feature = "stealth")]
         {
+            // `false` matches the reqwest path below (`with_options`); the
+            // CLI mirrors --allow-private-network into
+            // OBSCURA_ALLOW_PRIVATE_NETWORK at startup, which this client
+            // honours.
             let client = obscura_net::StealthHttpClient::with_proxy(
                 Arc::new(obscura_net::CookieJar::new()),
                 proxy.as_deref(),
+                false,
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
@@ -1433,6 +1567,28 @@ fn dump_markdown(page: &mut Page) -> String {
     result.as_str().unwrap_or_default().to_string()
 }
 
+fn is_html_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+fn append_readable_text_segment(result: &mut String, pending_space: &mut bool, contents: &str) {
+    let trimmed = contents.trim_matches(is_html_whitespace);
+    if trimmed.is_empty() {
+        if contents.chars().any(is_html_whitespace) {
+            *pending_space = true;
+        }
+        return;
+    }
+
+    let begins_with_space = contents.chars().next().is_some_and(is_html_whitespace);
+    let result_ends_with_space = result.chars().next_back().is_some_and(char::is_whitespace);
+    if (*pending_space || begins_with_space) && !result.is_empty() && !result_ends_with_space {
+        result.push(' ');
+    }
+    result.push_str(trimmed);
+    *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
+}
+
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
     use obscura_dom::NodeData;
 
@@ -1452,6 +1608,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
     const MAX_NODES: usize = 5_000_000;
 
     let mut result = String::new();
+    let mut pending_space = false;
     let mut stack: Vec<Work> = vec![Work::Visit(node_id)];
     let mut visited = 0usize;
 
@@ -1459,6 +1616,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
         let id = match work {
             Work::Newline => {
                 result.push('\n');
+                pending_space = false;
                 continue;
             }
             Work::Visit(id) => id,
@@ -1476,10 +1634,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
 
         match &node.data {
             NodeData::Text { contents } => {
-                let trimmed = contents.trim();
-                if !trimmed.is_empty() {
-                    result.push_str(trimmed);
-                }
+                append_readable_text_segment(&mut result, &mut pending_space, contents);
             }
             NodeData::Element { name, .. } => {
                 let tag = name.local.as_ref();
@@ -1532,6 +1687,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
 
                 if is_block {
                     result.push('\n');
+                    pending_space = false;
                     // Processed after all children (stack is LIFO): the trailing newline.
                     stack.push(Work::Newline);
                 }
@@ -2207,6 +2363,29 @@ mod tests {
     fn parsed_serve_command_is_not_quiet() {
         let args = Args::try_parse_from(["obscura", "serve"]).expect("clap should accept serve");
         assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_serve_accepts_repeated_font_directories() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "serve",
+            "--font-dir",
+            "/fonts/cjk",
+            "--font-dir",
+            "/fonts/brand",
+        ])
+        .expect("clap should accept repeatable --font-dir");
+        match args.command {
+            Some(Command::Serve { font_dirs, .. }) => assert_eq!(
+                font_dirs,
+                [
+                    std::path::PathBuf::from("/fonts/cjk"),
+                    std::path::PathBuf::from("/fonts/brand"),
+                ]
+            ),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]

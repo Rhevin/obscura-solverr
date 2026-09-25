@@ -100,7 +100,9 @@ impl BrowserState {
         if self.active_tab.is_none() {
             self.tab_counter += 1;
             let id = format!("tab-{}", self.tab_counter);
-            self.tabs.insert(id.clone(), Page::new("mcp-page".to_string(), self.context.clone()));
+            let page = Page::new("mcp-page".to_string(), self.context.clone());
+            page.set_console_messages_enabled(true);
+            self.tabs.insert(id.clone(), page);
             self.active_tab = Some(id);
         }
         let id = self.active_tab.as_ref().unwrap().clone();
@@ -111,7 +113,9 @@ impl BrowserState {
     fn new_tab(&mut self) -> String {
         self.tab_counter += 1;
         let id = format!("tab-{}", self.tab_counter);
-        self.tabs.insert(id.clone(), Page::new(format!("mcp-{id}"), self.context.clone()));
+        let page = Page::new(format!("mcp-{id}"), self.context.clone());
+        page.set_console_messages_enabled(true);
+        self.tabs.insert(id.clone(), page);
         self.active_tab = Some(id.clone());
         self.interactive_refs.clear();
         id
@@ -167,6 +171,42 @@ impl BrowserState {
             self.interactive_refs.clear();
         }
         Ok(reached_idle && !navigated)
+    }
+
+    /// Consume a navigation that a synthesized interaction just queued,
+    /// before the tool replies.
+    ///
+    /// A click on a submit button, an Enter keypress, or an evaluated
+    /// `location.href` assignment does not issue a request by itself. It runs
+    /// the page's own glue and leaves the navigation as pending state, which
+    /// becomes a request only when a driving layer converts it. The CDP path
+    /// already converts it, in `Input.dispatchMouseEvent` and after
+    /// `Runtime.evaluate`, which is why the same click POSTs over CDP and
+    /// does nothing over MCP (#618).
+    ///
+    /// [`Self::advance_active_page_tasks`] cannot cover this. It is armed
+    /// after every dispatch, but it sits in a `biased` select behind
+    /// `read_line`, so a client that sends its next tool call immediately,
+    /// which an agent does, wins that race every time. The reply is also
+    /// written before any pump turn could run, so the tool would answer
+    /// "Clicked" while the request has not left the process.
+    async fn settle_synthetic_navigation(&mut self) -> Result<(), String> {
+        let navigated = self
+            .page_mut()
+            .process_pending_navigation()
+            .await
+            .map_err(|error| error.to_string())?;
+        if navigated {
+            // The ref table names elements in a document that has gone away.
+            self.interactive_refs.clear();
+            // One slice on the landed document, so a tool that reads the URL
+            // or the text next sees the new page rather than an empty one.
+            self.page_mut()
+                .run_autonomous_event_loop_turn()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Resolve `ref=eN` to a CSS selector that uniquely targets the
@@ -268,7 +308,9 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
         },
         "serverInfo": {
             "name": "obscura-mcp",
-            "version": env!("CARGO_PKG_VERSION")
+            // Same build version the CLI reports (tag-derived at release time),
+            // so MCP clients see the version the binary was actually cut from.
+            "version": env!("OBSCURA_BUILD_VERSION")
         }
     }))
 }
@@ -719,12 +761,12 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
     let result = match name {
         "browser_navigate" => tool_navigate(args, state).await,
         "browser_snapshot" => tool_snapshot(args, state),
-        "browser_click" => tool_click(args, state),
-        "browser_fill" => tool_fill(args, state),
-        "browser_type" => tool_type(args, state),
-        "browser_press_key" => tool_press_key(args, state),
+        "browser_click" => tool_click(args, state).await,
+        "browser_fill" => tool_fill(args, state).await,
+        "browser_type" => tool_type(args, state).await,
+        "browser_press_key" => tool_press_key(args, state).await,
         "browser_select_option" => tool_select_option(args, state),
-        "browser_evaluate" => tool_evaluate(args, state),
+        "browser_evaluate" => tool_evaluate(args, state).await,
         "browser_wait_for" => tool_wait_for(args, state).await,
         "browser_network_requests" => tool_network_requests(state),
         "browser_console_messages" => tool_console_messages(state),
@@ -895,6 +937,12 @@ fn truncate(text: &str, max_chars: usize) -> String {
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str)
         .ok_or("Missing url parameter")?;
+    if url::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| parsed.scheme() == "file")
+    {
+        return Err("file:// navigation is disabled for MCP".to_string());
+    }
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
@@ -942,7 +990,7 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     Ok(format!("URL: {url}\nTitle: {title}\n\n{body}{refs_summary}"))
 }
 
-fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
 
     let js = format!(
@@ -962,11 +1010,12 @@ fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> 
         // A click can navigate or rewrite the DOM; the old ref table may
         // no longer match. Conservative: invalidate. Next snapshot rebuilds.
         state.interactive_refs.clear();
+        state.settle_synthetic_navigation().await?;
         Ok(format!("Clicked '{selector}'"))
     }
 }
 
-fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
     let value = args.get("value").and_then(Value::as_str)
         .ok_or("Missing value parameter")?;
@@ -988,11 +1037,12 @@ fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
+        state.settle_synthetic_navigation().await?;
         Ok(format!("Filled '{selector}' with value"))
     }
 }
 
-fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
     let text = args.get("text").and_then(Value::as_str)
         .ok_or("Missing text parameter")?;
@@ -1013,11 +1063,12 @@ fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
+        state.settle_synthetic_navigation().await?;
         Ok(format!("Typed into '{selector}'"))
     }
 }
 
-fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let key = args.get("key").and_then(Value::as_str)
         .ok_or("Missing key parameter")?;
     let selector = args.get("selector").and_then(Value::as_str);
@@ -1040,6 +1091,7 @@ fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, Stri
     );
 
     state.page_mut().evaluate(&js);
+    state.settle_synthetic_navigation().await?;
     Ok(format!("Pressed key '{key}'"))
 }
 
@@ -1072,11 +1124,12 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
     }
 }
 
-fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let expression = args.get("expression").and_then(Value::as_str)
         .ok_or("Missing expression parameter")?;
 
     let result = state.page_mut().evaluate(expression);
+    state.settle_synthetic_navigation().await?;
     Ok(match &result {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
@@ -1121,6 +1174,7 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
 
 fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     let page = state.page_mut();
+    page.sync_js_network_events();
     let events = &page.network_events;
 
     if events.is_empty() {
@@ -1134,7 +1188,13 @@ fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-fn tool_console_messages(state: &BrowserState) -> Result<String, String> {
+fn tool_console_messages(state: &mut BrowserState) -> Result<String, String> {
+    let messages = state.page_mut().take_pending_console_messages();
+    state.console_messages.extend(messages);
+    if state.console_messages.len() > 1_024 {
+        let overflow = state.console_messages.len() - 1_024;
+        state.console_messages.drain(..overflow);
+    }
     if state.console_messages.is_empty() {
         Ok("No console messages.".to_string())
     } else {
@@ -1784,52 +1844,94 @@ fn tool_tab_close(args: &Value, state: &mut BrowserState) -> Result<String, Stri
     Ok(summary)
 }
 
+fn is_html_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+fn append_text_segment(result: &mut String, pending_space: &mut bool, contents: &str) {
+    let trimmed = contents.trim_matches(is_html_whitespace);
+    if trimmed.is_empty() {
+        if contents.chars().any(is_html_whitespace) {
+            *pending_space = true;
+        }
+        return;
+    }
+
+    let begins_with_space = contents.chars().next().is_some_and(is_html_whitespace);
+    let result_ends_with_space = result.chars().next_back().is_some_and(char::is_whitespace);
+    if (*pending_space || begins_with_space) && !result.is_empty() && !result_ends_with_space {
+        result.push(' ');
+    }
+    result.push_str(trimmed);
+    *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
+}
+
 fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
     use obscura_dom::NodeData;
 
+    enum Work {
+        Visit(obscura_dom::NodeId),
+        Newline,
+    }
+
+    const MAX_NODES: usize = 5_000_000;
+
     let mut result = String::new();
-    let node = match dom.get_node(node_id) {
-        Some(n) => n,
-        None => return result,
-    };
+    let mut pending_space = false;
+    let mut stack = vec![Work::Visit(node_id)];
+    let mut visited = 0usize;
 
-    match &node.data {
-        NodeData::Text { contents } => {
-            let trimmed = contents.trim();
-            if !trimmed.is_empty() {
-                result.push_str(trimmed);
-                result.push(' ');
-            }
-        }
-        NodeData::Element { name, .. } => {
-            let tag = name.local.as_ref();
-            if matches!(tag, "script" | "style" | "noscript") {
-                return result;
-            }
-
-            let is_block = matches!(
-                tag,
-                "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "li" | "tr" | "br" | "hr" | "section" | "article"
-                    | "header" | "footer" | "nav" | "main" | "aside"
-                    | "blockquote" | "pre" | "ul" | "ol" | "table"
-            );
-
-            if is_block {
+    while let Some(work) = stack.pop() {
+        let id = match work {
+            Work::Newline => {
                 result.push('\n');
+                pending_space = false;
+                continue;
             }
+            Work::Visit(id) => id,
+        };
 
-            for child in dom.children(node_id) {
-                result.push_str(&extract_text(dom, child));
-            }
-
-            if is_block {
-                result.push('\n');
-            }
+        visited += 1;
+        if visited > MAX_NODES {
+            break;
         }
-        _ => {
-            for child in dom.children(node_id) {
-                result.push_str(&extract_text(dom, child));
+
+        let node = match dom.get_node(id) {
+            Some(node) => node,
+            None => continue,
+        };
+
+        match &node.data {
+            NodeData::Text { contents } => {
+                append_text_segment(&mut result, &mut pending_space, contents);
+            }
+            NodeData::Element { name, .. } => {
+                let tag = name.local.as_ref();
+                if matches!(tag, "script" | "style" | "noscript") {
+                    continue;
+                }
+
+                let is_block = matches!(
+                    tag,
+                    "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                        | "li" | "tr" | "br" | "hr" | "section" | "article"
+                        | "header" | "footer" | "nav" | "main" | "aside"
+                        | "blockquote" | "pre" | "ul" | "ol" | "table"
+                );
+
+                if is_block {
+                    result.push('\n');
+                    pending_space = false;
+                    stack.push(Work::Newline);
+                }
+                for child in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child));
+                }
+            }
+            _ => {
+                for child in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child));
+                }
             }
         }
     }
@@ -2022,6 +2124,15 @@ mod tests {
         }));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_navigation_rejects_local_files() {
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_navigate(&json!({"url": "file:///etc/passwd"}), &mut state)
+            .await
+            .expect_err("MCP must not expose local files");
+        assert!(error.contains("file:// navigation is disabled"));
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn render_tools_are_advertised_with_flat_schemas() {
@@ -2083,6 +2194,160 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn console_tool_returns_page_messages() {
+        const PAGE: &str = "data:text/html,<button id=log>Log</button><script>\
+            console.error('mcp-console-inline');\
+            document.getElementById('log').onclick=()=>{\
+                console.error('mcp-console-click');\
+                setTimeout(()=>{console.error('mcp-console-async');document.body.id='done'},25)\
+            }</script>";
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(PAGE)
+            .await
+            .expect("console test page should navigate");
+
+        let inline = tool_console_messages(&mut state).expect("console tool should succeed");
+        assert!(
+            inline.contains("mcp-console-inline"),
+            "inline console message missing from MCP output: {inline}"
+        );
+
+        tool_click(&json!({ "selector": "#log" }), &mut state)
+            .await
+            .expect("console test button should be clickable");
+        tool_wait_for(&json!({ "selector": "#done", "timeout": 2 }), &mut state)
+            .await
+            .expect("asynchronous console callback should complete");
+        let later = tool_console_messages(&mut state).expect("console tool should succeed");
+        assert!(later.contains("mcp-console-click"), "{later}");
+        assert!(later.contains("mcp-console-async"), "{later}");
+    }
+
+    /// Records the method, path and body of every request it serves, so a test
+    /// can assert what actually left the process rather than what the page
+    /// believes happened. Serves the issue's form at `/` and 200s everything
+    /// else.
+    fn spawn_form_recording_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                let start = raw.lines().next().unwrap_or("").to_string();
+                let mut parts = start.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                let _ = tx.send(format!("{method} {path} body='{body}'"));
+                let page = "<!doctype html><meta charset=utf-8>\
+                    <form id=f method=POST action=/submitted>\
+                    <input name=q id=q value=><button type=submit id=go>Envoyer</button></form>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    page.len(),
+                    page
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_on_a_submit_button_issues_the_request_before_replying() {
+        // A submit click runs the page's form glue and leaves the navigation as
+        // pending state; it only becomes a request when a driving layer converts
+        // it. The CDP path converts it, MCP did not, so the same click POSTed
+        // over CDP and did nothing over MCP (#618). Worse than doing nothing:
+        // `location.href` already reported the destination, so an agent was told
+        // the submit had happened while no request had left the process.
+        //
+        // The assertion is deliberately at the wire, not on `location.href`,
+        // because the URL was the thing that lied.
+        // nextest gives each test its own process, so this cannot reach a
+        // sibling. The recording server is on 127.0.0.1, which the SSRF gate
+        // refuses by default, exactly as the issue reporter had to pass
+        // --allow-private-network to run their repro.
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(&base)
+            .await
+            .expect("form page should navigate");
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the form page itself must be fetched")
+                .starts_with("GET /"),
+        );
+
+        tool_fill(&json!({ "selector": "#q", "value": "hello" }), &mut state)
+            .await
+            .expect("browser_fill should succeed");
+        tool_click(&json!({ "selector": "#go" }), &mut state)
+            .await
+            .expect("browser_click should succeed");
+
+        let submitted = requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the submit must reach the server before browser_click replies");
+        assert!(
+            submitted.starts_with("POST /submitted"),
+            "expected a POST to the form action, got {submitted}"
+        );
+        assert!(
+            submitted.contains("q=hello"),
+            "the submitted body must carry the filled field, got {submitted}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_tool_includes_completed_script_fetches() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(&base)
+            .await
+            .expect("test page should navigate");
+        requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the test page itself must be fetched");
+
+        let fetch_url = serde_json::to_string(&format!("{base}/script-request"))
+            .expect("fetch URL should serialize");
+        state.page_mut().evaluate(&format!(
+            "fetch({fetch_url}).then(() => document.body.id = 'fetch-complete')"
+        ));
+        tool_wait_for(
+            &json!({ "selector": "#fetch-complete", "timeout": 2 }),
+            &mut state,
+        )
+        .await
+        .expect("script fetch should complete");
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the script fetch must reach the server");
+        assert!(request.starts_with("GET /script-request"), "got {request}");
+
+        let output = tool_network_requests(&mut state).expect("network tool should succeed");
+        assert!(
+            output.contains("/script-request"),
+            "completed script fetch missing from network history: {output}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fill_tools_notify_controlled_input_tracker() {
         let mut state = BrowserState::new(None, None, false);
         state
@@ -2126,11 +2391,13 @@ mod tests {
             &json!({ "selector": "#field", "value": "filled" }),
             &mut state,
         )
+        .await
         .expect("browser_fill should succeed");
         tool_type(
             &json!({ "selector": "#field", "text": "-typed" }),
             &mut state,
         )
+        .await
         .expect("browser_type should succeed");
         tool_fill_form(
             &json!({

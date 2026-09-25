@@ -71,3 +71,10 @@ cosmic-text = { path = "vendor/cosmic-text" }
 # would turn every catchable op panic into a hard crash.
 [profile.release]
 panic = "unwind"
+
+[profile.release-dist]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

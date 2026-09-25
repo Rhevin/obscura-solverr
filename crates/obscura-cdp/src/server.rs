@@ -50,6 +50,133 @@ const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
+
+fn control_token_from_env() -> anyhow::Result<Option<String>> {
+    let token = std::env::var("OBSCURA_CDP_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if token.as_ref().is_some_and(|value| value.len() < 32) {
+        anyhow::bail!("OBSCURA_CDP_TOKEN must be at least 32 bytes");
+    }
+    Ok(token)
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+}
+
+fn bearer_authorized(head: &str, expected: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(expected) => header_value(head, "authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|provided| constant_time_eq(provided, expected)),
+    }
+}
+
+fn host_matches_bind(
+    host_header: &str,
+    bind_ip: std::net::IpAddr,
+    port: u16,
+    forwarded: Option<(std::net::IpAddr, u16)>,
+) -> bool {
+    let Ok(url) = url::Url::parse(&format!("http://{host_header}/")) else {
+        return false;
+    };
+    fn host_matches_ip(url: &url::Url, bind_ip: std::net::IpAddr) -> bool {
+        if bind_ip.is_unspecified() {
+            return true;
+        }
+        match (url.host(), bind_ip) {
+            (Some(url::Host::Ipv4(address)), std::net::IpAddr::V4(bind)) => {
+                address == bind || (bind.is_loopback() && address.is_loopback())
+            }
+            (Some(url::Host::Ipv6(address)), std::net::IpAddr::V6(bind)) => {
+                address == bind || (bind.is_loopback() && address.is_loopback())
+            }
+            (Some(url::Host::Ipv4(address)), std::net::IpAddr::V6(bind)) => {
+                bind.is_loopback() && address.is_loopback()
+            }
+            (Some(url::Host::Ipv6(address)), std::net::IpAddr::V4(bind)) => {
+                bind.is_loopback() && address.is_loopback()
+            }
+            (Some(url::Host::Domain(domain)), _) => {
+                bind_ip.is_loopback() && domain.eq_ignore_ascii_case("localhost")
+            }
+            (None, _) => false,
+        }
+    }
+    (url.port_or_known_default() == Some(port) && host_matches_ip(&url, bind_ip))
+        || forwarded.is_some_and(|(forwarded_ip, forwarded_port)| {
+            url.port_or_known_default() == Some(forwarded_port)
+                && host_matches_ip(&url, forwarded_ip)
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlRefusal {
+    BrowserOrigin,
+    ForeignHost,
+    Unauthorized,
+    OversizedHead,
+}
+
+fn control_refusal(
+    head: &str,
+    bind_ip: std::net::IpAddr,
+    port: u16,
+    forwarded: Option<(std::net::IpAddr, u16)>,
+    auth_token: Option<&str>,
+) -> Option<ControlRefusal> {
+    if header_value(head, "origin").is_some() {
+        return Some(ControlRefusal::BrowserOrigin);
+    }
+    if !header_value(head, "host")
+        .is_some_and(|host| host_matches_bind(host, bind_ip, port, forwarded))
+    {
+        return Some(ControlRefusal::ForeignHost);
+    }
+    if !bearer_authorized(head, auth_token) {
+        return Some(ControlRefusal::Unauthorized);
+    }
+    None
+}
+
+fn refuse_control_connection(mut stream: std::net::TcpStream, refusal: ControlRefusal) {
+    use std::io::Write;
+    let (status, reason) = match refusal {
+        ControlRefusal::Unauthorized => ("401 Unauthorized", "authentication required"),
+        ControlRefusal::OversizedHead => (
+            "431 Request Header Fields Too Large",
+            "request head too large",
+        ),
+        ControlRefusal::BrowserOrigin | ControlRefusal::ForeignHost => {
+            ("403 Forbidden", "request refused")
+        }
+    };
+    let body = format!("{{\"error\":\"{reason}\"}}");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -173,6 +300,33 @@ pub async fn start_with_serve_options_and_limit(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
     let addr = SocketAddr::new(ip, port);
+    let auth_token = control_token_from_env()?;
+    let forwarded_host = std::env::var("OBSCURA_CDP_FORWARDED_HOST").ok();
+    let forwarded_port = std::env::var("OBSCURA_CDP_FORWARDED_PORT").ok();
+    let forwarded = match (forwarded_host, forwarded_port) {
+        (None, None) => None,
+        (Some(host), Some(port)) => Some((
+            host.parse::<std::net::IpAddr>().map_err(|error| {
+                anyhow::anyhow!("invalid OBSCURA_CDP_FORWARDED_HOST '{}': {}", host, error)
+            })?,
+            port.parse::<u16>().map_err(|error| {
+                anyhow::anyhow!("invalid OBSCURA_CDP_FORWARDED_PORT '{}': {}", port, error)
+            })?,
+        )),
+        _ => anyhow::bail!(
+            "OBSCURA_CDP_FORWARDED_HOST and OBSCURA_CDP_FORWARDED_PORT must be set together"
+        ),
+    };
+    if forwarded.is_some() && !ip.is_loopback() {
+        anyhow::bail!("forwarded CDP authority is only valid for loopback workers");
+    }
+    let publicly_reachable = !ip.is_loopback()
+        || forwarded.is_some_and(|(forwarded_ip, _)| !forwarded_ip.is_loopback());
+    if publicly_reachable && auth_token.is_none() {
+        anyhow::bail!(
+            "refusing to expose CDP without authentication; set OBSCURA_CDP_TOKEN to at least 32 bytes"
+        );
+    }
 
     // Issue #62: the HTTP control plane (/json/version, /json) must remain
     // reachable even while V8 JS evaluation blocks the tokio LocalSet thread.
@@ -183,8 +337,10 @@ pub async fn start_with_serve_options_and_limit(
     // forwarded to the existing LocalSet for CDP processing.
     let std_listener = std::net::TcpListener::bind(addr)
         .map_err(|e| anyhow::anyhow!("bind {}:{}: {}", host, port, e))?;
+    // Non-blocking so the accept thread can alternate between draining the
+    // backlog and re-polling parked connections (see the accept thread below).
     std_listener
-        .set_nonblocking(false)
+        .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
 
     info!("Obscura CDP server listening on ws://{}:{}", host, port);
@@ -194,6 +350,9 @@ pub async fn start_with_serve_options_and_limit(
     );
     if allow_file_access {
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
+    }
+    if auth_token.is_some() {
+        info!("CDP bearer authentication enabled");
     }
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
@@ -205,23 +364,103 @@ pub async fn start_with_serve_options_and_limit(
     // Dedicated accept thread: drains the kernel backlog immediately and
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
+    //
+    // A connection that is accepted but never sends its request head
+    // (speculative browser preconnects, port probes, slow-loris clients)
+    // must not be able to park this single thread in a blocking read: every
+    // later connection, including CDP clients like Playwright's
+    // connectOverCDP, would then sit in the kernel backlog unanswered until
+    // its own connect timeout (issue #715). The thread therefore never
+    // blocks on a *stream* — undecided connections are parked and re-polled
+    // every ACCEPT_POLL_INTERVAL, and dropped once they outlive
+    // SILENT_CONNECTION_TTL without sending a request head.
+    //
+    // While nothing is parked the thread blocks in accept() itself, the
+    // pre-#715 fast path: zero added latency for the next connection and no
+    // CPU while idle. Blocking on the listener is safe — it waits for the
+    // kernel, not for client bytes. While something is parked, the listener
+    // is drained without blocking at least once per 1 ms poll round, far
+    // above any real connect rate, so the kernel backlog cannot overflow
+    // under a connection burst.
     let accept_flag = shutdown_flag.clone();
+    let accept_auth_token = auth_token.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
-            for stream in std_listener.incoming() {
-                if accept_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                match stream {
-                    Ok(stream) => {
-                        if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
-                            if !format!("{}", e).contains("close") {
-                                error!("Accept dispatch error: {}", e);
+            let mut pending: Vec<(std::net::TcpStream, std::time::Instant)> = Vec::new();
+            while !accept_flag.load(Ordering::Relaxed) {
+                if pending.is_empty() {
+                    // Fast path: nothing parked, block until a connection
+                    // arrives, then classify it in the sweep below.
+                    let _ = std_listener.set_nonblocking(false);
+                    match std_listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(true);
+                            pending.push((stream, std::time::Instant::now()));
+                        }
+                        Err(e) => {
+                            error!("Accept error: {}", e);
+                            // A persistent error (e.g. EMFILE) must not turn
+                            // into a log flood while the thread idles.
+                            std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                        }
+                    }
+                    let _ = std_listener.set_nonblocking(true);
+                } else {
+                    // Drain everything the kernel has already queued for us.
+                    loop {
+                        match std_listener.accept() {
+                            Ok((stream, _)) => {
+                                let _ = stream.set_nonblocking(true);
+                                if pending.len() < MAX_SILENT_PENDING {
+                                    pending.push((stream, std::time::Instant::now()));
+                                } else {
+                                    warn!(
+                                        "dropping connection: {} connections parked without a request head",
+                                        MAX_SILENT_PENDING
+                                    );
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                error!("Accept error: {}", e);
+                                break;
                             }
                         }
                     }
-                    Err(e) => error!("Accept error: {}", e),
+                }
+                // Give every parked connection a chance to speak; keep the
+                // ones still silent and inside the TTL, dispatch the ones
+                // with a request head. Dropping a stream closes its socket.
+                for (stream, since) in std::mem::take(&mut pending) {
+                    if since.elapsed() >= SILENT_CONNECTION_TTL {
+                        continue;
+                    }
+                    match peek_request_head(&stream) {
+                        PeekStatus::NotReady => pending.push((stream, since)),
+                        PeekStatus::Closed => {}
+                        PeekStatus::Oversized => {
+                            refuse_control_connection(stream, ControlRefusal::OversizedHead);
+                        }
+                        PeekStatus::Head(head) => {
+                            if let Err(e) = accept_dispatch(
+                                stream,
+                                ip,
+                                port,
+                                forwarded,
+                                accept_auth_token.as_deref(),
+                                &ws_tx,
+                                &head,
+                            ) {
+                                if !format!("{}", e).contains("close") {
+                                    error!("Accept dispatch error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !pending.is_empty() {
+                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
                 }
             }
         })?;
@@ -426,6 +665,24 @@ fn cap_malloc_arenas() {
     }
 }
 
+/// Return free glibc heap pages after the last CDP connection tears down.
+///
+/// A connection owns its pages, DOMs, render buffers, and V8 isolates. Dropping
+/// those objects releases the allocations, but glibc normally keeps the freed
+/// pages mapped for reuse, so a server that becomes idle can retain its peak RSS
+/// indefinitely (#873). Trimming only when this is the final live connection
+/// avoids imposing a process-wide allocator pause on active clients.
+fn release_idle_connection_memory() {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: malloc_trim is process-wide and thread-safe. The caller has
+        // already dropped this connection's LocalSet and Tokio runtime.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
 /// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
 /// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
 /// `CdpContext` and pages) and its frame reader. Confining a connection's pages
@@ -444,10 +701,17 @@ fn run_connection(
     // however it exits — clean close, error return, or panic. A plain
     // decrement at the end of the closure would leak slots on the early
     // returns below until the cap wedged the server shut.
-    struct SlotGuard(Arc<AtomicUsize>);
+    struct SlotGuard(Option<Arc<AtomicUsize>>);
+    impl SlotGuard {
+        fn release(&mut self) -> Option<usize> {
+            self.0
+                .take()
+                .map(|counter| counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1))
+        }
+    }
     impl Drop for SlotGuard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::AcqRel);
+            self.release();
         }
     }
 
@@ -455,7 +719,7 @@ fn run_connection(
     let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
         .spawn(move || {
-            let _slot = SlotGuard(slot);
+            let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(
                 context_template.isolated_copy("default".to_string(), true),
             );
@@ -495,6 +759,12 @@ fn run_connection(
                 let _ = processor.await;
             });
 
+            // `LocalSet` owns any detached local navigation tasks, and the
+            // runtime owns their scheduler allocations. Drop both before the
+            // idle trim so every page allocation is eligible to be returned.
+            drop(local);
+            drop(rt);
+
             // Apply only this connection's cookie changes to the persistence
             // template. Unchanged cookies cannot overwrite another connection's
             // updates, while explicit deletes and replacements still persist.
@@ -506,6 +776,11 @@ fn run_connection(
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
                 persistence_context.save_cookies();
+            }
+
+            drop(persisted_context);
+            if slot_guard.release() == Some(0) {
+                release_idle_connection_memory();
             }
         });
 
@@ -597,45 +872,103 @@ fn refuse_connection(stream: std::net::TcpStream) {
 }
 
 const HTTP_PEEK_BUF: usize = 4096;
-const WS_PEEK_BUF: usize = 4;
+
+/// How long a freshly accepted connection may sit without sending a request
+/// head before the accept thread drops it. Real clients send their handshake
+/// immediately after connecting; only probes and preconnects linger.
+const SILENT_CONNECTION_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the accept thread re-polls parked connections that have not sent
+/// a request head yet. Also the retry delay on a persistent accept error, so
+/// it cannot become a log flood. Only paid while something is actually
+/// parked; an idle server blocks in accept() and polls nothing.
+const ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Cap on connections parked without a request head. Bounds the accept
+/// thread's polling work and the server's fd usage under probe floods.
+const MAX_SILENT_PENDING: usize = 256;
+
+/// Result of polling a freshly accepted connection for its request head.
+enum PeekStatus {
+    /// No classifiable request head yet; poll again next accept round.
+    NotReady,
+    /// Peer went away without sending a full head.
+    Closed,
+    /// The header terminator did not fit in the bounded peek buffer. Refuse it;
+    /// security-sensitive headers could otherwise be hidden beyond the cap.
+    Oversized,
+    /// A classifiable request head.
+    Head(String),
+}
+
+/// Peek — without consuming — at a freshly accepted connection's request
+/// head. `GET` requests are only classified once the terminating blank line
+/// has arrived, so `/json` route matching never sees a truncated head;
+/// anything that cannot be a `GET` is handed over immediately so non-HTTP
+/// garbage still gets tungstenite's prompt rejection instead of waiting out
+/// the silent-connection TTL.
+fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
+    let mut buf = [0u8; HTTP_PEEK_BUF];
+    let n = match stream.peek(&mut buf) {
+        Ok(0) => return PeekStatus::Closed,
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return PeekStatus::NotReady,
+        Err(_) => return PeekStatus::Closed,
+    };
+    let head = &buf[..n];
+    if n >= 4 && head[..4] != *b"GET " {
+        return PeekStatus::Head(String::from_utf8_lossy(head).into_owned());
+    }
+    let complete = head.windows(4).any(|w| w == b"\r\n\r\n");
+    if !complete {
+        return if n == HTTP_PEEK_BUF {
+            PeekStatus::Oversized
+        } else {
+            PeekStatus::NotReady
+        };
+    }
+    PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
+}
 
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
-/// Peek at the first bytes to decide HTTP vs WebSocket:
+/// The connection's request head has already been peeked by the accept loop
+/// (`peek_request_head`) and is passed in as `head`:
 /// - HTTP (`GET /json/*`): serve synchronously via blocking I/O so the
 ///   response is never stalled by the LocalSet.
-/// - WebSocket: set non-blocking, convert to tokio `TcpStream`, and forward
-///   to the LocalSet for CDP processing.
+/// - WebSocket: forward to the LocalSet for CDP processing.
 fn accept_dispatch(
     stream: std::net::TcpStream,
+    bind_ip: std::net::IpAddr,
     port: u16,
+    forwarded: Option<(std::net::IpAddr, u16)>,
+    auth_token: Option<&str>,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    head: &str,
 ) -> anyhow::Result<()> {
-    let mut buf = [0u8; WS_PEEK_BUF];
-    let n = stream.peek(&mut buf)?;
-
-    if n >= 4 && &buf == b"GET " {
-        let mut peek_buf = [0u8; HTTP_PEEK_BUF];
-        let n = stream.peek(&mut peek_buf)?;
-        let line = String::from_utf8_lossy(&peek_buf[..n]);
-
-        let endpoint = if line.contains("/json/version") {
-            Some("version")
-        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
-            Some("list")
-        } else if line.contains("/json/protocol") {
-            Some("protocol")
-        } else {
-            None
-        };
-
-        if let Some(ep) = endpoint {
-            return handle_http_json_blocking(stream, port, ep);
-        }
-        // Fall through: GET request that isn't a /json endpoint → treat as
-        // WebSocket upgrade (Chromium DevTools clients issue GET with
-        // Upgrade: websocket).
+    if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token) {
+        refuse_control_connection(stream, refusal);
+        return Ok(());
     }
+    let endpoint = if head.contains("/json/version") {
+        Some("version")
+    } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
+        Some("list")
+    } else if head.contains("/json/protocol") {
+        Some("protocol")
+    } else {
+        None
+    };
+
+    if let Some(ep) = endpoint {
+        // The request head is already sitting in the kernel receive buffer;
+        // switch back to blocking mode for the synchronous /json serve.
+        let _ = stream.set_nonblocking(false);
+        return handle_http_json_blocking(stream, port, ep, head);
+    }
+    // Fall through: GET request that isn't a /json endpoint → treat as
+    // WebSocket upgrade (Chromium DevTools clients issue GET with
+    // Upgrade: websocket).
 
     // Try to hand off the WS stream to the LocalSet. If the bounded channel
     // is full the LocalSet is saturated — drop the connection cleanly
@@ -659,11 +992,13 @@ fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
     port: u16,
     endpoint: &str,
+    request_head: &str,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
     let mut buf = vec![0u8; 4096];
     let _ = stream.read(&mut buf)?;
+    let authority = websocket_authority(request_head, port);
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
@@ -672,7 +1007,7 @@ fn handle_http_json_blocking(
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
+            "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
         }))?,
         "list" => serde_json::to_string_pretty(&json!([{
             "description": "",
@@ -681,7 +1016,7 @@ fn handle_http_json_blocking(
             "title": "",
             "type": "page",
             "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/page-1", port),
+            "webSocketDebuggerUrl": format!("ws://{}/devtools/page/page-1", authority),
         }]))?,
         "protocol" => {
             serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
@@ -696,6 +1031,27 @@ fn handle_http_json_blocking(
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+fn websocket_authority(request_head: &str, port: u16) -> String {
+    request_head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| {
+            let Ok(url) = url::Url::parse(&format!("http://{value}/")) else {
+                return false;
+            };
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"))
 }
 
 /// Per-connection CDP processor. Each connection runs its own processor (with
@@ -789,7 +1145,9 @@ async fn cdp_processor(
                             tokio::task::yield_now().await;
                         }
                     }
+                    service_live_page_render_resources(&mut ctx);
                     sync_live_page_network_events(&mut ctx);
+                    dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
@@ -974,57 +1332,100 @@ fn emit_intercepted_request(
 }
 
 async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
-    let Some(page) = ctx.pages.iter_mut().find(|page| page.has_js()) else {
+    // Several pages on one connection can be live at once (#872), each with its
+    // own event loop, so pump a turn on *every* live page rather than only the
+    // first. The pump stays armed until all live pages report idle.
+    let live_ids: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .map(|page| page.id.clone())
+        .collect();
+    if live_ids.is_empty() {
         return Ok(true);
-    };
-    page.run_autonomous_event_loop_turn().await
+    }
+    let mut all_idle = true;
+    for page_id in live_ids {
+        if let Some(page) = ctx.get_page_mut(&page_id) {
+            all_idle &= page.run_autonomous_event_loop_turn().await?;
+        }
+    }
+    Ok(all_idle)
+}
+
+/// Apply finished background render-resource loads and start loads for
+/// resources the last layout/paint missed, for every live page. Runs before a
+/// command (so it observes bytes that landed while the client was silent),
+/// after a command (so its layout misses start loading immediately) and after
+/// each autonomous pump turn.
+fn service_live_page_render_resources(ctx: &mut CdpContext) {
+    for page in ctx.pages.iter_mut().filter(|page| page.has_js()) {
+        page.queue_pending_render_resources();
+    }
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
-        ctx.sessions
+    // Emit script-initiated network events for every live page, each attributed
+    // to its own session/frame — not just the first live page (#872).
+    let live_ids: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .map(|page| page.id.clone())
+        .collect();
+    for page_id in live_ids {
+        let Some(session_id) = ctx
+            .sessions
             .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| {
-                (
-                    Some(session_id.clone()),
-                    page.id.clone(),
-                    page.frame_id.clone(),
-                    page.url_string(),
-                )
-            })
-    });
-    let Some((session_id, page_id, frame_id, page_url)) = page_route else {
-        return;
-    };
-    let network_events = {
-        let Some(page) = ctx.get_page_mut(&page_id) else {
-            return;
+            .find(|(_, pid)| *pid == &page_id)
+            .map(|(session_id, _)| Some(session_id.clone()))
+        else {
+            continue;
         };
-        page.sync_js_network_events();
-        page.network_events.drain(..).collect::<Vec<_>>()
-    };
-    crate::domains::page::emit_runtime_network_events(
-        ctx,
-        &session_id,
-        &frame_id,
-        &page_url,
-        &page_id,
-        &network_events,
-    );
+        let (frame_id, page_url, network_events) = {
+            let Some(page) = ctx.get_page_mut(&page_id) else {
+                continue;
+            };
+            page.sync_js_network_events();
+            (
+                page.frame_id.clone(),
+                page.url_string(),
+                page.network_events.drain(..).collect::<Vec<_>>(),
+            )
+        };
+        if network_events.is_empty() {
+            continue;
+        }
+        crate::domains::page::emit_runtime_network_events(
+            ctx,
+            &session_id,
+            &frame_id,
+            &page_url,
+            &page_id,
+            &network_events,
+        );
+    }
 }
 
 fn take_live_pending_navigation(
     ctx: &CdpContext,
 ) -> Option<(String, String, String, String)> {
-    let page = ctx.pages.iter().find(|page| page.has_js())?;
-    let session_id = ctx
-        .sessions
-        .iter()
-        .find(|(_, page_id)| *page_id == &page.id)
-        .map(|(session_id, _)| session_id.clone())?;
-    let (url, method, body) = page.take_pending_navigation()?;
-    Some((session_id, url, method, body))
+    // With several live pages, a pending navigation may belong to any of them,
+    // not just the first live page — scan until one yields a navigation (#872).
+    for page in ctx.pages.iter().filter(|page| page.has_js()) {
+        let Some(session_id) = ctx
+            .sessions
+            .iter()
+            .find(|(_, page_id)| *page_id == &page.id)
+            .map(|(session_id, _)| session_id.clone())
+        else {
+            continue;
+        };
+        if let Some((url, method, body)) = page.take_pending_navigation() {
+            return Some((session_id, url, method, body));
+        }
+    }
+    None
 }
 
 fn forward_pending_events(
@@ -1081,7 +1482,7 @@ fn is_navigate_method(text: &str) -> bool {
 // Fetch.continueRequest / fulfillRequest) into a map. Returns None when the
 // `headers` field is absent, so the caller can leave the request's headers
 // untouched rather than clearing them.
-fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
+pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
     let arr = params.get("headers")?.as_array()?;
     Some(
         arr.iter()
@@ -1122,14 +1523,18 @@ fn handle_fetch_resolution(
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
                     let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    // `body` is a lossy text view; `body_base64` carries the CDP
+                    // body (already base64) through unchanged so op_fetch_url can
+                    // hand JS the exact bytes for a binary fulfill (#912).
                     let body = decode_base64(raw_body);
+                    let body_base64 = raw_body.to_string();
                     let headers = req.params.get("responseHeaders")
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|h| {
                             Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
                         }).collect())
                         .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }
                 }
                 "Fetch.failRequest" => {
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
@@ -1191,20 +1596,15 @@ async fn process_with_interception(
         }
     };
 
-    // Issue #19 follow-up: V8 only allows ONE entered Isolate per OS thread.
-    // The regular dispatch path enforces this via `get_session_page_mut`
-    // (which `suspend_js`'es every other page before letting the target
-    // page run JS). The interception path here bypasses that — it removes
-    // the target page and spawns a nav task — so we have to enforce the
-    // same invariant explicitly. Otherwise nav-2's `init_js` constructs
-    // Isolate-2 while page-1's Isolate-1 is still alive in ctx.pages, and
-    // the next V8 scope unwind aborts the process via `Context::Exit`'s
-    // `heap->isolate() == Isolate::TryGetCurrent()` check.
-    for other in ctx.pages.iter_mut() {
-        if other.has_js() {
-            other.suspend_js();
-        }
-    }
+    // V8 allows only ONE *entered* isolate per OS thread, but many *live*
+    // ones. Since #756 every op enters its isolate only transiently (never
+    // across an `.await`) and construction leaves the entry stack empty, so a
+    // nav task's `init_js` can build a new isolate while other pages' isolates
+    // are live without tripping `Context::Exit`'s
+    // `heap->isolate() == Isolate::TryGetCurrent()` check. The old defensive
+    // `suspend_js` of every other page here (which tore their heaps down and
+    // was never resumed once the dispatch-path resume was removed in #872) is
+    // therefore no longer needed and would strand concurrent pages.
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let wait_until = crate::domains::page::parse_wait_until(&req.params);
@@ -1424,7 +1824,9 @@ async fn process_cdp_message(
 
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
+    service_live_page_render_resources(ctx);
     let response = dispatch::dispatch(&req, ctx).await;
+    service_live_page_render_resources(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
     // (e.g. Target.targetCreated + Target.attachedToTarget from
@@ -1459,7 +1861,7 @@ async fn process_cdp_message(
     }
 }
 
-fn decode_base64(input: &str) -> String {
+pub(crate) fn decode_base64(input: &str) -> String {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -1491,7 +1893,7 @@ fn fast_path_response(text: &str) -> Option<String> {
 
     let result = match req.method.as_str() {
         "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
+        "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
         "Emulation.setTouchEmulationEnabled" |
@@ -1614,13 +2016,116 @@ async fn handle_connection_ws(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        bearer_authorized, control_refusal, handle_fetch_resolution, is_navigate_method,
+        merge_cookie_delta, parse_cdp_headers, websocket_authority, ControlRefusal,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn native_head(host: &str) -> String {
+        format!(
+            "GET /devtools/browser HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn native_loopback_cdp_request_is_allowed() {
+        let head = native_head("127.0.0.1:9222");
+        assert_eq!(
+            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_origin_and_rebound_host_are_refused() {
+        let with_origin = native_head("127.0.0.1:9222").replace(
+            "Upgrade: websocket",
+            "Origin: https://evil.example\r\nUpgrade: websocket",
+        );
+        assert_eq!(
+            control_refusal(
+                &with_origin,
+                "127.0.0.1".parse().unwrap(),
+                9222,
+                None,
+                None,
+            ),
+            Some(ControlRefusal::BrowserOrigin)
+        );
+        assert_eq!(
+            control_refusal(
+                &native_head("rebind.example:9222"),
+                "127.0.0.1".parse().unwrap(),
+                9222,
+                None,
+                None,
+            ),
+            Some(ControlRefusal::ForeignHost)
+        );
+    }
+
+    #[test]
+    fn loopback_worker_accepts_only_its_forwarded_public_port() {
+        let bind = "127.0.0.1".parse().unwrap();
+        let forwarded = Some((bind, 9222));
+        assert_eq!(
+            control_refusal(&native_head("127.0.0.1:9222"), bind, 9223, forwarded, None),
+            None
+        );
+        assert_eq!(
+            control_refusal(
+                &native_head("rebind.example:9222"),
+                bind,
+                9223,
+                forwarded,
+                None,
+            ),
+            Some(ControlRefusal::ForeignHost)
+        );
+        assert_eq!(
+            control_refusal(&native_head("127.0.0.1:9444"), bind, 9223, forwarded, None),
+            Some(ControlRefusal::ForeignHost)
+        );
+    }
+
+    #[test]
+    fn public_worker_authority_still_requires_authentication() {
+        let bind = "127.0.0.1".parse().unwrap();
+        let public = Some(("0.0.0.0".parse().unwrap(), 9222));
+        let head = native_head("cdp.example.test:9222");
+        assert_eq!(
+            control_refusal(&head, bind, 9223, public, Some("secret")),
+            Some(ControlRefusal::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn configured_cdp_token_is_mandatory() {
+        let token = "01234567890123456789012345678901";
+        let mut head = native_head("127.0.0.1:9222");
+        assert!(!bearer_authorized(&head, Some(token)));
+        head = head.replace(
+            "Upgrade: websocket",
+            &format!("Authorization: Bearer {token}\r\nUpgrade: websocket"),
+        );
+        assert!(bearer_authorized(&head, Some(token)));
+    }
+
+    #[test]
+    fn discovery_uses_the_client_facing_http_authority() {
+        let request = "GET /json/version HTTP/1.1\r\nhOsT: cdp.example.test:9222\r\n\r\n";
+        assert_eq!(
+            websocket_authority(request, 9223),
+            "cdp.example.test:9222"
+        );
+
+        let malformed = "GET /json/version HTTP/1.1\r\nHost: attacker.test/path\r\n\r\n";
+        assert_eq!(websocket_authority(malformed, 9223), "127.0.0.1:9223");
+    }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {
@@ -1746,6 +2251,138 @@ mod tests {
                     .unwrap();
                     if value["id"] == 3 {
                         assert_eq!(value["result"]["result"]["value"], "yes");
+                        break;
+                    }
+                }
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_navigation_acknowledges_input_before_navigation_events() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                reply_rx.recv().await.expect("processor init");
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.createTarget",
+                    "params": {"url": "about:blank"},
+                }));
+
+                let mut session_id = None;
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("create target timeout")
+                            .expect("create target response"),
+                    )
+                    .unwrap();
+                    if session_id.is_none() {
+                        session_id = value["params"]["sessionId"].as_str().map(str::to_string);
+                    }
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attached page session");
+
+                send(json!({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {"expression": "document.body.innerHTML='<a id=route href=\"data:text/html,navigated\">go</a>';document.elementFromPoint=()=>route"},
+                }));
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("setup timeout")
+                            .expect("setup response"),
+                    )
+                    .unwrap();
+                    if value["id"] == 2 {
+                        break;
+                    }
+                }
+
+                for (id, event_type) in [(3, "mousePressed"), (4, "mouseReleased")] {
+                    send(json!({
+                        "id": id,
+                        "method": "Input.dispatchMouseEvent",
+                        "sessionId": session_id,
+                        "params": {"type": event_type, "x": 0, "y": 0, "button": "left"},
+                    }));
+                    if id == 3 {
+                        loop {
+                            let value: serde_json::Value = serde_json::from_str(
+                                &tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    reply_rx.recv(),
+                                )
+                                .await
+                                .expect("mouse press timeout")
+                                .expect("mouse press response"),
+                            )
+                            .unwrap();
+                            if value["id"] == 3 {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let mut input_acknowledged = false;
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("click navigation timeout")
+                            .expect("click navigation response"),
+                    )
+                    .unwrap();
+                    if value["id"] == 4 {
+                        input_acknowledged = true;
+                    }
+                    if value["method"] == "Page.frameNavigated"
+                        && value["params"]["frame"]["url"]
+                            .as_str()
+                            .is_some_and(|url| url.starts_with("data:text/html,navigated"))
+                    {
+                        assert!(
+                            input_acknowledged,
+                            "Input.dispatchMouseEvent must be acknowledged before click navigation events"
+                        );
                         break;
                     }
                 }

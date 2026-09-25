@@ -562,14 +562,22 @@ struct ParsedOverflowAxis {
     inherit: bool,
 }
 
+const OVERFLOW_VISIBLE: u8 = 0;
+const OVERFLOW_CLIP: u8 = 1;
+const OVERFLOW_HIDDEN: u8 = 2;
+const OVERFLOW_SCROLL: u8 = 3;
+const OVERFLOW_AUTO: u8 = 4;
+
 fn parse_overflow_axis(value: &str) -> Option<ParsedOverflowAxis> {
     let lower = value.trim().to_ascii_lowercase();
     let (specified, inherit) = match lower.as_str() {
-        "visible" => (0, false),
-        "clip" => (1, false),
-        "hidden" | "scroll" | "auto" | "overlay" => (2, false),
-        "inherit" => (0, true),
-        "initial" | "unset" | "revert" | "revert-layer" => (0, false),
+        "visible" => (OVERFLOW_VISIBLE, false),
+        "clip" => (OVERFLOW_CLIP, false),
+        "hidden" => (OVERFLOW_HIDDEN, false),
+        "scroll" => (OVERFLOW_SCROLL, false),
+        "auto" | "overlay" => (OVERFLOW_AUTO, false),
+        "inherit" => (OVERFLOW_VISIBLE, true),
+        "initial" | "unset" | "revert" | "revert-layer" => (OVERFLOW_VISIBLE, false),
         _ => return None,
     };
     Some(ParsedOverflowAxis { specified, inherit })
@@ -618,23 +626,35 @@ fn parse_overflow_declaration(
     }
 }
 
+pub(crate) fn computed_overflow_axes(style: &LayoutStyle) -> (u8, u8) {
+    let mut computed_x = style.overflow_specified_x;
+    let mut computed_y = style.overflow_specified_y;
+    if computed_x <= OVERFLOW_CLIP && computed_y > OVERFLOW_CLIP {
+        computed_x = if computed_x == OVERFLOW_VISIBLE {
+            OVERFLOW_AUTO
+        } else {
+            OVERFLOW_HIDDEN
+        };
+    }
+    if computed_y <= OVERFLOW_CLIP && computed_x > OVERFLOW_CLIP {
+        computed_y = if computed_y == OVERFLOW_VISIBLE {
+            OVERFLOW_AUTO
+        } else {
+            OVERFLOW_HIDDEN
+        };
+    }
+    (computed_x, computed_y)
+}
+
 pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
     // CSS Overflow computed-value coupling: if exactly one axis is scrollable,
     // `visible` on the other computes to `auto` and `clip` computes to
     // `hidden`. A clip/visible pair remains genuinely axis-specific.
-    let mut computed_x = style.overflow_specified_x;
-    let mut computed_y = style.overflow_specified_y;
-    if (computed_x == 2) != (computed_y == 2) {
-        if computed_x == 2 {
-            computed_y = 2;
-        } else {
-            computed_x = 2;
-        }
-    }
-    style.overflow_clip_x = computed_x != 0;
-    style.overflow_clip_y = computed_y != 0;
-    style.overflow_scroll_x = computed_x == 2;
-    style.overflow_scroll_y = computed_y == 2;
+    let (computed_x, computed_y) = computed_overflow_axes(style);
+    style.overflow_clip_x = computed_x != OVERFLOW_VISIBLE;
+    style.overflow_clip_y = computed_y != OVERFLOW_VISIBLE;
+    style.overflow_scroll_x = computed_x > OVERFLOW_CLIP;
+    style.overflow_scroll_y = computed_y > OVERFLOW_CLIP;
     style.overflow_hidden = style.overflow_clip_x || style.overflow_clip_y;
     style.overflow_scroll_container = style.overflow_scroll_x || style.overflow_scroll_y;
 }
@@ -1466,6 +1486,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             };
         }
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
+        "pointer-events" => {
+            style.pointer_events_none = Some(value.eq_ignore_ascii_case("none"));
+        }
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
         "animation" => apply_animation_shorthand(style, value),
         "animation-name" => {
@@ -1730,8 +1753,6 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             });
         }
         "text-decoration" | "text-decoration-line" => {
-            // Shorthand can carry color/style/thickness; we only model the
-            // underline line (the dominant case, and the UA default for links).
             let toks: Vec<String> = value
                 .split_whitespace()
                 .map(|t| t.to_ascii_lowercase())
@@ -1739,6 +1760,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             let underline = toks.iter().any(|t| t == "underline");
             let none = toks.iter().any(|t| t == "none");
             style.underline = Some(underline && !none);
+            style.overline = Some(!none && toks.iter().any(|token| token == "overline"));
+            style.line_through = Some(!none && toks.iter().any(|token| token == "line-through"));
         }
         "gap" | "grid-gap" => {
             let values = split_ws_paren(value);
@@ -2123,6 +2146,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "overflow-y"
             | "scrollbar-gutter"
             | "visibility"
+            | "pointer-events"
             | "opacity"
             | "animation"
             | "animation-name"
@@ -2309,6 +2333,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "visible" | "hidden" | "collapse"
         ),
+        "pointer-events" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "none"),
         "scrollbar-gutter" => matches!(
             value.to_ascii_lowercase().as_str(),
             "auto" | "stable" | "stable both-edges"
@@ -3036,7 +3061,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         ),
         "text-decoration" | "text-decoration-line" => lower
             .split_whitespace()
-            .all(|token| matches!(token, "none" | "underline")),
+            .all(|token| matches!(token, "none" | "underline" | "overline" | "line-through")),
         "line-height" => lower == "normal" || finite_number(value) || dimension(value, false),
         "gap" | "grid-gap" => dimensions(value, false, 2),
         "row-gap" | "grid-row-gap" | "column-gap" | "grid-column-gap" | "-webkit-column-gap" => {
@@ -6383,7 +6408,32 @@ struct LengthContext {
     percent_base: f32,
 }
 
+// CSS math functions recurse through nested calc()/min()/max()/clamp()
+// expressions. Real stylesheets stay shallow; bounding the nesting prevents a
+// hostile declaration from exhausting the native stack before it is rejected.
+const MAX_CSS_MATH_NESTING: usize = 64;
+
+fn css_math_nesting_is_safe(value: &str) -> bool {
+    let mut depth = 0usize;
+    for character in value.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                if depth > MAX_CSS_MATH_NESTING {
+                    return false;
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
 fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
+    if !css_math_nesting_is_safe(value) {
+        return None;
+    }
     let value = value.trim();
     if let Some(rest) = value.strip_prefix('(') {
         let end = find_matching_paren(rest)?;
@@ -6607,6 +6657,9 @@ fn eval_contextual_product(term: &str, context: &LengthContext) -> Option<f32> {
 /// example from Wikipedia's icon sizing), so each case recurses back into
 /// this function rather than assuming a flat expression.
 fn resolve_length(value: &str) -> Option<f32> {
+    if !css_math_nesting_is_safe(value) {
+        return None;
+    }
     let v = value.trim();
     if let Some(rest) = v.strip_prefix('(') {
         let end = find_matching_paren(rest)?;
@@ -10821,6 +10874,26 @@ mod tests {
         // calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))
         let expr = "calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))";
         assert_eq!(resolve_length(expr), Some(20.0));
+    }
+
+    #[test]
+    fn deeply_nested_css_math_is_rejected_without_recursing() {
+        let mut expression = "1px".to_string();
+        for _ in 0..5_000 {
+            expression = format!("calc({expression})");
+        }
+
+        assert_eq!(resolve_length(&expression), None);
+        assert_eq!(
+            resolve_contextual_length(&expression, 16.0, 16.0, 10.0, 10.0, 100.0),
+            None
+        );
+
+        let mut ordinary = "1px".to_string();
+        for _ in 0..8 {
+            ordinary = format!("calc({ordinary})");
+        }
+        assert_eq!(resolve_length(&ordinary), Some(1.0));
     }
 
     #[test]

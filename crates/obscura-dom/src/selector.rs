@@ -500,7 +500,9 @@ impl<'a> Element for DomElement<'a> {
             PseudoClass::Enabled => self.is_form_control() && !self.has_boolean_attr("disabled"),
             PseudoClass::Disabled => self.is_form_control() && self.has_boolean_attr("disabled"),
             PseudoClass::Checked => {
-                self.has_boolean_attr("checked") || self.has_boolean_attr("selected")
+                self.tree
+                    .form_control_checked(self.node_id)
+                    .unwrap_or_else(|| self.has_boolean_attr("checked") || self.has_boolean_attr("selected"))
             }
             // Dynamic user-interaction pseudo-classes have no meaning against
             // a static DOM snapshot with no live user input.
@@ -730,6 +732,13 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        // Element.querySelector() scopes :scope to the element on which it was
+        // called. Leaving this unset makes the selector crate use the document
+        // element, so `root.querySelector(':scope .nested .item')` can treat
+        // `root` itself as `.nested` and return direct children incorrectly.
+        if self.with_node(root, |node| node.is_element()).unwrap_or(false) {
+            context.scope_element = Some(DomElement::new(self, root).opaque());
+        }
 
         for desc_id in self.descendants(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
@@ -772,6 +781,9 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        if self.with_node(root, |node| node.is_element()).unwrap_or(false) {
+            context.scope_element = Some(DomElement::new(self, root).opaque());
+        }
         let mut results = Vec::new();
 
         for desc_id in self.descendants(root) {
@@ -809,6 +821,7 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = Some(DomElement::new(self, nid).opaque());
         Ok(selectors::matching::matches_selector_list(
             &selector_list,
             &DomElement::new(self, nid),
@@ -1688,6 +1701,31 @@ mod tests {
         assert!(tree.query_selector_from(root, ".x").unwrap().is_none());
         // `span` finds the child.
         assert!(tree.query_selector_from(root, "span").unwrap().is_some());
+    }
+
+    #[test]
+    fn scoped_queries_bind_scope_to_the_element_root() {
+        let tree = parse_html(
+            r#"<ul id="root" class="menu">
+                <li id="direct" class="item">direct</li>
+                <li><ul class="menu"><li id="nested" class="item">nested</li></ul></li>
+            </ul>"#,
+        );
+        let root = tree.get_element_by_id("root").expect("ul#root");
+        let direct = tree.get_element_by_id("direct").expect("li#direct");
+        let nested = tree.get_element_by_id("nested").expect("li#nested");
+
+        assert_eq!(
+            tree.query_selector_all_from(root, ":scope > .item")
+                .unwrap(),
+            vec![direct]
+        );
+        assert_eq!(
+            tree.query_selector_all_from(root, ":scope .menu .item")
+                .unwrap(),
+            vec![nested]
+        );
+        assert!(tree.matches_selector(root, ":scope").unwrap());
     }
 
     #[test]

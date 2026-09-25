@@ -2,6 +2,7 @@ use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
@@ -248,11 +249,32 @@ pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
 
+/// Host-fetched author CSS kept outside the page-visible DOM.
+///
+/// A linked stylesheet may participate in rendering even when the response is
+/// not origin-clean. Keeping those bytes here prevents a synthetic `<style>`
+/// node from exposing them through ordinary DOM APIs.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalStylesheet {
+    pub sources: Vec<Arc<str>>,
+    pub origin_clean: bool,
+}
+
+/// Live control state is separate from content attributes and serialization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormControlState {
+    pub value: Option<String>,
+    pub checked: Option<bool>,
+    pub indeterminate: bool,
+}
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    form_controls: HashMap<NodeId, FormControlState>,
+    external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -284,6 +306,8 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                form_controls: HashMap::new(),
+                external_stylesheets: HashMap::new(),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -294,6 +318,114 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    pub fn replace_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        inner.external_stylesheets.insert(
+            owner,
+            ExternalStylesheet {
+                sources: vec![Arc::from(source)],
+                origin_clean,
+            },
+        );
+        true
+    }
+
+    pub fn append_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        let sheet = inner
+            .external_stylesheets
+            .entry(owner)
+            .or_insert_with(|| ExternalStylesheet {
+                sources: Vec::new(),
+                origin_clean: true,
+            });
+        sheet.sources.push(Arc::from(source));
+        sheet.origin_clean &= origin_clean;
+        true
+    }
+
+    pub fn remove_external_stylesheet(&self, owner: NodeId) -> bool {
+        self.inner
+            .borrow_mut()
+            .external_stylesheets
+            .remove(&owner)
+            .is_some()
+    }
+
+    pub fn external_stylesheet(&self, owner: NodeId) -> Option<ExternalStylesheet> {
+        self.inner
+            .borrow()
+            .external_stylesheets
+            .get(&owner)
+            .cloned()
+    }
+
+    pub fn external_stylesheets(&self) -> HashMap<NodeId, ExternalStylesheet> {
+        self.inner.borrow().external_stylesheets.clone()
+    }
+
+    pub fn form_control_state(&self, node: NodeId) -> Option<FormControlState> {
+        self.inner.borrow().form_controls.get(&node).cloned()
+    }
+
+    pub fn form_control_value_matches(&self, node: NodeId, value: &str) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.value.as_deref())
+            == Some(value)
+    }
+
+    pub fn form_control_checked(&self, node: NodeId) -> Option<bool> {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.checked)
+    }
+
+    pub fn form_control_indeterminate(&self, node: NodeId) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .is_some_and(|control| control.indeterminate)
+    }
+
+    pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.nodes.get(node.index()).is_some_and(|entry| entry.as_ref().is_some_and(Node::is_element)) {
+            update(inner.form_controls.entry(node).or_default());
+        }
     }
 
     /// Record whether the document was parsed in (full) quirks mode.
@@ -912,6 +1044,7 @@ impl DomTree {
         // same NodeId to two live nodes (aliasing).
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
+                inner.form_controls.remove(&id);
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -1431,6 +1564,10 @@ impl DomTree {
         }
         let source_data = self.get_node(source_node_id)?.data;
         let cloned_root = self.new_node(source_data);
+        if let Some(mut state) = self.form_control_state(source_node_id) {
+            state.indeterminate = false;
+            self.update_form_control_state(cloned_root, |control| *control = state);
+        }
         let mut stack = Vec::new();
         self.prepare_cloned_children(source_node_id, cloned_root, deep, &mut stack);
 
@@ -1440,6 +1577,10 @@ impl DomTree {
                 None => continue,
             };
             let cloned_node = self.new_node(source_data);
+            if let Some(mut state) = self.form_control_state(source_node) {
+                state.indeterminate = false;
+                self.update_form_control_state(cloned_node, |control| *control = state);
+            }
             self.append_child(dest_parent, cloned_node);
             self.prepare_cloned_children(source_node, cloned_node, true, &mut stack);
         }
