@@ -19,6 +19,63 @@ fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
     format!("{page_frame_id}-frame-{frame_id}")
 }
 
+fn is_localhost(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn secure_context_type(url: &url::Url) -> &'static str {
+    match url.scheme() {
+        "https" | "wss" | "file" | "about" => "Secure",
+        "http" | "ws" if is_localhost(url) => "SecureLocalhost",
+        _ => "InsecureScheme",
+    }
+}
+
+/// Build the required `Page.Frame` fields in one place. Generated CDP clients
+/// deserialize this object before their frame managers see it, so every path
+/// that returns or emits a frame must use the same protocol-complete shape.
+pub(crate) fn frame_value(
+    id: &str,
+    parent_id: Option<&str>,
+    loader_id: &str,
+    url: &str,
+    mime_type: &str,
+) -> Value {
+    let parsed_url = url::Url::parse(url).ok();
+    let security_origin = parsed_url
+        .as_ref()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "null".to_string());
+    let secure_context = parsed_url
+        .as_ref()
+        .map(secure_context_type)
+        .unwrap_or("InsecureScheme");
+    let mut frame = json!({
+        "id": id,
+        "loaderId": loader_id,
+        "url": url,
+        "domainAndRegistry": "",
+        "securityOrigin": security_origin,
+        "mimeType": mime_type,
+        "adFrameStatus": { "adFrameType": "none" },
+        "secureContextType": secure_context,
+        "crossOriginIsolatedContextType": "NotIsolated",
+        "gatedAPIFeatures": [],
+    });
+    if let Some(parent_id) = parent_id {
+        frame["parentId"] = json!(parent_id);
+    }
+    frame
+}
+
 fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm) -> Value {
     let id = child_frame_id(page_frame_id, frame.frame_id());
     let parent_id = if frame.parent_frame_id() == 0 {
@@ -26,16 +83,13 @@ fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm)
     } else {
         child_frame_id(page_frame_id, frame.parent_frame_id())
     };
-    json!({
-        "id": id,
-        "parentId": parent_id,
-        "loaderId": format!("{id}-loader"),
-        "url": frame.url(),
-        "domainAndRegistry": "",
-        "securityOrigin": frame.origin(),
-        "mimeType": "text/html",
-        "adFrameStatus": { "adFrameType": "none" },
-    })
+    frame_value(
+        &id,
+        Some(&parent_id),
+        &format!("{id}-loader"),
+        frame.url(),
+        "text/html",
+    )
 }
 
 /// The page's child frames, flattened with each parent ahead of its children
@@ -59,7 +113,7 @@ pub fn child_frame_values(page: &obscura_browser::Page) -> Vec<Value> {
 
 /// The page's live frame hierarchy. `childFrames` used to be hardcoded empty,
 /// so a client was told the page had no frames however many it had built.
-fn frame_tree(page: &obscura_browser::Page) -> Value {
+fn frame_tree(page: &obscura_browser::Page, loader_id: &str) -> Value {
     fn children(page: &obscura_browser::Page, parent_frame_id: u32) -> Vec<Value> {
         page.frames
             .iter()
@@ -74,15 +128,13 @@ fn frame_tree(page: &obscura_browser::Page) -> Value {
     }
 
     json!({
-        "frame": {
-            "id": page.frame_id,
-            "loaderId": "initial-loader",
-            "url": page.url_string(),
-            "domainAndRegistry": "",
-            "securityOrigin": page.url_string(),
-            "mimeType": "text/html",
-            "adFrameStatus": { "adFrameType": "none" },
-        },
+        "frame": frame_value(
+            &page.frame_id,
+            None,
+            loader_id,
+            &page.url_string(),
+            "text/html",
+        ),
         "childFrames": children(page, 0),
     })
 }
@@ -798,6 +850,7 @@ pub fn emit_navigation_events(
 ) {
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
+    ctx.nav_events_emitted.insert(page_id.to_string());
     let es = session_id.clone();
     let ts = timestamp();
 
@@ -854,51 +907,32 @@ pub fn emit_navigation_events(
         });
     }
 
-    // executionContextsCleared invalidates every prior context id, so a
-    // Runtime.evaluate / callFunctionOn targeting a pre-navigation context
-    // must be rejected (Chrome: "Cannot find context with specified id"). The
-    // default world (id 2) and isolated worlds are re-registered below as their
-    // executionContextCreated events are emitted. Issue #407: previously this
-    // set was insert-only, so stale ids kept validating and grew unbounded.
-    ctx.valid_context_ids.clear();
-    let mut phase1 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextsCleared".into(),
-            params: json!({}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.frameNavigated".into(),
-            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        },
-    ];
-    // The default world is re-created as context id 2; re-register it. Isolated
-    // worlds register themselves via next_isolated_context in the loop below.
-    ctx.valid_context_ids.insert(2);
-    let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
-        vec!["__puppeteer_utility_world__24.40.0".to_string()]
-    } else {
-        ctx.isolated_worlds.clone()
-    };
-    // Issue #192: fresh, monotonically increasing executionContextId per re-create.
-    for world_name in &world_names {
-        let world_ctx_id = ctx.next_isolated_context();
-        phase1.push(CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        });
+    let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
+    let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
+    let mut phase1 = vec![CdpEvent {
+        method: "Page.lifecycleEvent".into(),
+        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+        session_id: es.clone(),
+    }];
+    for runtime_session in &runtime_sessions {
+        phase1.push(CdpEvent::with_session(
+            "Runtime.executionContextsCleared",
+            json!({}),
+            runtime_session.clone(),
+        ));
+    }
+    phase1.push(CdpEvent {
+        method: "Page.frameNavigated".into(),
+        params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
+        session_id: es.clone(),
+    });
+    for runtime_session in runtime_sessions {
+        for context in &contexts {
+            phase1.push(super::runtime::execution_context_created_event(
+                context,
+                Some(runtime_session.clone()),
+            ));
+        }
     }
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
@@ -1207,7 +1241,47 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            // Chrome loads a new target's initial about:blank right after
+            // createTarget, so by the time a client attaches and calls
+            // Page.enable the page has already produced its load events.
+            // obscura creates pages silently, which starves clients that wait
+            // for the initial load: chromiumoxide's new_page blocks until the
+            // main frame's "load" lifecycle event arrives (#833). Emit those
+            // events once, the first time a session enables the page domain
+            // on a page that has not emitted a navigation. This is not a
+            // document change, so there is no execution-context churn: the
+            // existing context announced by Runtime.enable stays valid.
+            let initial = ctx.get_session_page(session_id).and_then(|page| {
+                if ctx.nav_events_emitted.contains(&page.id) {
+                    return None;
+                }
+                Some((page.id.clone(), page.frame_id.clone(), page.url_string()))
+            });
+            if let Some((page_id, frame_id, url)) = initial {
+                ctx.nav_events_emitted.insert(page_id.clone());
+                let ts = timestamp();
+                let loader_id = format!("loader-blank-{page_id}");
+                let es = session_id.clone();
+                // Build the frame through the schema-complete helper: generated
+                // CDP clients (chromiumoxide) reject a frameNavigated payload
+                // missing secureContextType/crossOriginIsolatedContextType and
+                // drop the whole connection (#833).
+                let frame = frame_value(&frame_id, None, &loader_id, &url, "text/html");
+                let events = vec![
+                    CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": frame, "type": "Navigation"}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id, "timestamp": ts}), session_id: es },
+                ];
+                ctx.pending_events.extend(events);
+            }
+            Ok(json!({}))
+        }
         "navigate" => {
             let url = params
                 .get("url")
@@ -1229,62 +1303,62 @@ pub async fn handle(
             let page = ctx
                 .get_session_page(session_id)
                 .ok_or("No page for session")?;
-            Ok(json!({ "frameTree": frame_tree(page) }))
+            let loader_id = ctx
+                .current_loader_ids
+                .get(&page.id)
+                .cloned()
+                .unwrap_or_else(|| format!("loader-blank-{}", page.id));
+            Ok(json!({ "frameTree": frame_tree(page, &loader_id) }))
         }
         "createIsolatedWorld" => {
-            let (frame_id_param, world_name, page_url, page_id) = {
+            let (frame_id_param, world_name, origin, page_id, persist_across_navigation) = {
                 let page = ctx
                     .get_session_page(session_id)
                     .ok_or("No page for session")?;
-                (
-                    params
+                let frame_id = params
                         .get("frameId")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&page.frame_id)
-                        .to_string(),
+                        .to_string();
+                let (origin, persist) = if frame_id == page.frame_id {
+                    (page.url_string(), true)
+                } else if let Some(frame) = page.frames.iter().find(|frame| {
+                    child_frame_id(&page.frame_id, frame.frame_id()) == frame_id
+                }) {
+                    (frame.url().to_string(), false)
+                } else {
+                    return Err(format!("No frame with given id found: {frame_id}"));
+                };
+                (
+                    frame_id,
                     params
                         .get("worldName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    page.url_string(),
+                    origin,
                     page.id.clone(),
+                    persist,
                 )
             };
-            // Track this world so Page.navigate can re-emit a context for it
-            // post-navigation. Without this, Playwright (and Puppeteer)
-            // hang in any operation that uses the utility world — including
-            // page.title() — because their utility world is gone after
-            // Runtime.executionContextsCleared and never re-created.
-            if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
-                ctx.isolated_worlds.push(world_name.clone());
+            ctx.ensure_default_context(&page_id)
+                .ok_or("No page for session")?;
+            let (context, created) = ctx.create_isolated_context(
+                &page_id,
+                &frame_id_param,
+                &origin,
+                &world_name,
+                persist_across_navigation,
+            );
+            if created {
+                for runtime_session in ctx.runtime_sessions_for_page(&page_id) {
+                    ctx.pending_events.push(super::runtime::execution_context_created_event(
+                        &context, Some(runtime_session),
+                    ));
+                }
             }
-            // Issue #192: every isolated world emission gets a fresh id from
-            // the monotonic counter and is registered as a valid contextId.
-            // Reusing id 100 across navigations made Playwright's bookkeeping
-            // diverge (it expected 101 on the second nav) and Runtime.evaluate
-            // failed with "Cannot find context with specified id: 101".
-            let context_id = ctx.next_isolated_context();
 
-            ctx.pending_events.push(CdpEvent {
-                method: "Runtime.executionContextCreated".to_string(),
-                params: json!({
-                    "context": {
-                        "id": context_id,
-                        "origin": page_url,
-                        "name": world_name,
-                        "uniqueId": format!("ctx-isolated-{}-{}", page_id, context_id),
-                        "auxData": {
-                            "isDefault": false,
-                            "type": "isolated",
-                            "frameId": frame_id_param,
-                        }
-                    }
-                }),
-                session_id: session_id.clone(),
-            });
-
-            Ok(json!({ "executionContextId": context_id }))
+            Ok(json!({ "executionContextId": context.id }))
         }
         "setLifecycleEventsEnabled" => Ok(json!({})),
         "addScriptToEvaluateOnNewDocument" => {
@@ -1399,34 +1473,48 @@ pub async fn handle(
         }
         "navigateToHistoryEntry" => {
             let entry_id = params.get("entryId").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let target_url = {
+            // Snapshot history and the current cursor BEFORE moving it, so a
+            // navigation that fails can roll back to where the page actually is
+            // instead of leaving currentIndex on an entry it never reached (#920).
+            let (target_url, saved_history, prev_index) = {
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
                 let url = page.history.get(entry_id).cloned();
+                let snapshot = (page.history.clone(), page.history_index);
                 if url.is_some() {
                     page.set_history_index(entry_id);
                 }
-                url
+                (url, snapshot.0, snapshot.1)
             };
             if let Some(url) = target_url {
-                // Stash + restore history so push_history doesn't clobber
-                // the cursor we just moved.
-                let stash = {
-                    let page = ctx
-                        .get_session_page_mut(session_id)
-                        .ok_or("No page for session")?;
-                    (page.history.clone(), page.history_index)
-                };
-                let (frame_id, page_id, network_events, page_url, reached_idle) = {
+                let nav_result = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
                     page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
                         .await
-                        .map_err(|e| e.to_string())?;
-                    page.history = stash.0;
-                    page.history_index = stash.1;
+                };
+                // navigate_with_wait's push_history rewrote history during the
+                // load, so restore the snapshot either way. On failure the page
+                // never moved — put the cursor back where it was (#920).
+                if let Err(e) = nav_result {
+                    if let Some(page) = ctx.get_session_page_mut(session_id) {
+                        page.history = saved_history;
+                        page.history_index = prev_index;
+                    }
+                    return Err(e.to_string());
+                }
+                let (frame_id, page_id, network_events, page_url, reached_idle) = {
+                    let page = ctx
+                        .get_session_page_mut(session_id)
+                        .ok_or("No page for session")?;
+                    page.history = saved_history;
+                    page.history_index = entry_id;
+                    // Flush script-initiated network events before draining,
+                    // matching do_navigate — otherwise fetch/XHR requests the
+                    // navigated page starts are dropped from CDP events (#920).
+                    page.sync_js_network_events();
                     (
                         page.frame_id.clone(),
                         page.id.clone(),
@@ -1672,6 +1760,127 @@ fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    // #920: a history navigation that fails to load must not move the recorded
+    // currentIndex — the page never actually went anywhere, so a later
+    // getNavigationHistory must still report where it really is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_history_navigation_leaves_current_index_unchanged() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.history = vec![
+                "data:text/html,<p>ok</p>".to_string(),
+                "not-a-url".to_string(),
+            ];
+            page.history_index = 0;
+        }
+
+        let res = handle(
+            "navigateToHistoryEntry",
+            &json!({ "entryId": 1 }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "navigating to an invalid entry URL must fail, got {res:?}"
+        );
+
+        let index = ctx.get_session_page(&session).unwrap().history_index;
+        assert_eq!(
+            index, 0,
+            "a failed history navigation must leave currentIndex where the page actually is"
+        );
+    }
+
+    // Guard the success path (there was no coverage): a valid back-navigation
+    // moves currentIndex to the target entry and preserves the history list.
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_navigation_moves_current_index_on_success() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.history = vec![
+                "data:text/html,<title>a</title>".to_string(),
+                "data:text/html,<title>b</title>".to_string(),
+            ];
+            page.history_index = 1;
+        }
+
+        handle(
+            "navigateToHistoryEntry",
+            &json!({ "entryId": 0 }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigating back to a valid entry must succeed");
+
+        let page = ctx.get_session_page(&session).unwrap();
+        assert_eq!(page.history_index, 0, "currentIndex must move to the target entry");
+        assert_eq!(page.history.len(), 2, "history must be preserved across the navigation");
+    }
+
+    // #833: chromiumoxide's new_page waits for the initial target's "load"
+    // lifecycle event before returning. Page.enable on a freshly created
+    // (silently loaded) page must emit the initial load sequence once, with a
+    // schema-complete frame, and must not replay it on a second enable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_enable_emits_the_initial_load_events_once() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        handle("enable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("enable must succeed");
+        let names: Vec<&str> = ctx
+            .pending_events
+            .iter()
+            .map(|e| e.method.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Page.frameNavigated"),
+            "frameNavigated must be emitted, got {names:?}"
+        );
+        assert!(
+            names.contains(&"Page.loadEventFired"),
+            "loadEventFired must be emitted, got {names:?}"
+        );
+        let frame_navigated = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Page.frameNavigated")
+            .expect("frameNavigated present");
+        let frame = &frame_navigated.params["frame"];
+        for field in ["id", "loaderId", "url", "secureContextType", "crossOriginIsolatedContextType"] {
+            assert!(
+                !frame[field].is_null(),
+                "frameNavigated frame must carry {field}: {frame}"
+            );
+        }
+        assert!(ctx.pending_events.is_empty() == false);
+
+        ctx.pending_events.clear();
+        handle("enable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("second enable must succeed");
+        assert!(
+            ctx.pending_events.is_empty(),
+            "the initial sequence must not replay on a second enable"
+        );
+    }
 
     #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {

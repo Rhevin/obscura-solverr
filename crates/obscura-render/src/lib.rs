@@ -99,6 +99,7 @@ mod paint;
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,
     paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces,
@@ -111,6 +112,7 @@ pub use paint::{
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state,
     screenshot_png, screenshot_png_scrolled, screenshot_png_scrolled_at_animation_time,
+    screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources,
     screenshot_png_scrolled_at_animation_time_with_surface_color,
     prepare_dom_with_retained_attribute_styles, prepare_dom_with_retained_styles,
     prepare_dom_with_retained_styles_at_animation_time,
@@ -135,6 +137,8 @@ pub use paint::{
 // `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.
 #[cfg(feature = "paint")]
 pub mod inline;
+#[cfg(feature = "paint")]
+pub use inline::configure_font_directories;
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
@@ -143,7 +147,7 @@ pub mod inline {
 
     #[derive(Clone)]
     pub(crate) struct WebFont {
-        pub data: Vec<u8>,
+        pub data: std::sync::Arc<Vec<u8>>,
         pub family: Option<String>,
         pub weight: Option<(u16, u16)>,
         pub italic: Option<bool>,
@@ -1409,6 +1413,9 @@ pub struct LayoutStyle {
     /// a real inherited CSS property). Resolved into `effectively_invisible`
     /// during `dom::layout_dom`'s inheritance pass.
     pub visibility_hidden: Option<bool>,
+    /// Computed `pointer-events: none|auto`. The property is inherited, so
+    /// `None` means the top-down style pass still needs the parent's value.
+    pub pointer_events_none: Option<bool>,
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,
@@ -1551,6 +1558,8 @@ pub struct LayoutStyle {
     /// text, so it is propagated into the shaped spans of the element's subtree
     /// (this is what underlines links, which are underlined by UA default).
     pub underline: Option<bool>,
+    pub overline: Option<bool>,
+    pub line_through: Option<bool>,
 
     /// `font-style: italic|oblique`. Inherited. Selects an available oblique
     /// face when shaping; the bundled Linux `system-ui` face synthesizes its

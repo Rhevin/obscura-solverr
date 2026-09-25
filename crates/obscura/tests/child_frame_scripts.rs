@@ -267,6 +267,34 @@ async fn window_post_message_delivers_to_the_same_window() {
     assert_eq!(page.evaluate("window.__syncGot").as_f64(), Some(0.0));
 }
 
+/// SEC-001 / #704 — a self-post must honour targetOrigin: a message restricted
+/// to a different origin is dropped, while the page's own origin and "/" are
+/// delivered.
+#[tokio::test]
+async fn window_post_message_honours_target_origin() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(
+        r#"<!doctype html><html><body><script>
+  window.__got = [];
+  window.addEventListener('message', (e) => window.__got.push(String(e.data)));
+  window.postMessage('LEAK', 'https://other.example');   // mismatched -> dropped
+  window.postMessage('OK', window.location.origin);      // exact origin -> delivered
+  window.postMessage('SLASH', '/');                      // same-origin as sender -> delivered
+</script></body></html>"#,
+    );
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(1000).await;
+
+    assert_eq!(
+        page.evaluate("window.__got"),
+        serde_json::json!(["OK", "SLASH"]),
+        "a self-post with a non-matching targetOrigin must be dropped; matching ones delivered",
+    );
+}
+
 /// A parser-created `<iframe src>` never goes through the `src` setter, so
 /// nothing used to start its load at all.
 #[tokio::test]

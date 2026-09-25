@@ -22,6 +22,18 @@ Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Pag
 OBSCURA_NAV_TIMEOUT_MS=60000 obscura serve
 ```
 
+### `OBSCURA_NAV_CHAIN_LIMIT`
+
+How many documents a navigation chain may load, the first navigation included. Default 10, which allows the requested document and nine navigations the page itself triggers via `location` assignments or form submissions. Raise the value for an endpoint that chains longer for good reasons, such as an SSO handover across several providers. The low default is what stops a page that resets `location` on every load.
+
+A zero is raised to 1. This loads the requested document. If the page wants to chain further afterwards, the call reports an error, as at any other limit. A value the engine does not read as a number is replaced by the default. This also applies to a negative value and to a value with a trailing space.
+
+The time budget is not tied to this limit. A longer chain usually also needs a higher `OBSCURA_NAV_TIMEOUT_MS`, because its default of 30 seconds applies to the whole chain and not to the individual document.
+
+```bash
+OBSCURA_NAV_CHAIN_LIMIT=20 obscura serve
+```
+
 ### `OBSCURA_SCRIPT_DEADLINE_MS`
 
 Soft deadline for the complete page script-execution phase, including classic scripts and ES modules. Default 30000 (30 seconds). Raise it for a heavy SPA whose initial module is responsible for mounting an otherwise empty document. The engine also uses this value as a hard V8 watchdog budget, with a one-second grace period, so a synchronous script cannot run forever.
@@ -48,6 +60,16 @@ Per-command deadline for the CDP server. A hung page (a runaway `Runtime.evaluat
 OBSCURA_CDP_COMMAND_TIMEOUT_MS=30000 obscura serve
 ```
 
+### `OBSCURA_CDP_TOKEN`
+
+Bearer token for the CDP discovery and WebSocket endpoints. It is optional on
+loopback. A non-loopback bind is refused unless this is set to at least 32
+bytes. Pass it as `Authorization: Bearer <token>` in the CDP client's headers.
+
+```bash
+OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" obscura serve --host 0.0.0.0
+```
+
 ### `OBSCURA_FETCH_TIMEOUT_MS`
 
 Request timeout for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads. Without it a request to a server that accepts the connection but never responds (including a CORS preflight) hangs forever and the XHR is stuck with no completion event. Default 30000 (30 seconds).
@@ -67,6 +89,21 @@ OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
 ## Stealth and identity
 
 These tune the browser identity the engine presents so it stays internally consistent. See [Configure stealth and proxies](Configure-stealth-and-proxies.md) for the full picture.
+
+### `OBSCURA_BLOCK_TRACKERS`
+
+Controls the tracker blocklist used by the stealth HTTP transport. It is on by
+default so `--stealth` retains its current privacy-first behavior. Set it to
+`0`, `false`, `no`, or `off` to keep the stealth TLS/browser fingerprint while
+allowing tracker requests.
+
+The setting is read when a stealth client is created. Values are case-insensitive
+and surrounding whitespace is ignored; unset, empty, and unrecognized values keep
+blocking enabled. Non-stealth transport settings and SSRF protection are unchanged.
+
+```bash
+OBSCURA_BLOCK_TRACKERS=0 obscura --stealth fetch https://example.com
+```
 
 ### `OBSCURA_TIMEZONE`
 
@@ -104,10 +141,19 @@ OBSCURA_ROTATE_PROFILE=1 obscura serve
 
 ### `OBSCURA_MCP_ALLOWED_ORIGINS`
 
-Comma-separated `Origin` allowlist for the HTTP MCP transport (`obscura mcp --http`). Off by default, which keeps the permissive behavior. When set, a browser request whose `Origin` is not listed is refused with `403` before it can drive the server; native, non-browser MCP clients (which send no `Origin`) are always allowed. Use it to stop cross-origin pages from reaching a loopback MCP port.
+Comma-separated `Origin` allowlist for the HTTP MCP transport (`obscura mcp --http`). Browser requests are refused by default; when set, only listed origins are accepted. Native, non-browser MCP clients (which send no `Origin`) are always allowed.
 
 ```bash
 OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" obscura mcp --http --host 0.0.0.0
+```
+
+### `OBSCURA_MCP_TOKEN`
+
+Bearer token for MCP HTTP requests. It is optional on loopback. A non-loopback
+bind is refused unless this is set to at least 32 bytes.
+
+```bash
+OBSCURA_MCP_TOKEN="$(openssl rand -hex 32)" obscura mcp --http --host 0.0.0.0
 ```
 
 ## Logging

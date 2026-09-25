@@ -4,17 +4,6 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
-/// Escape a client-supplied objectId for interpolation into a single-quoted JS
-/// string literal (`__obscura_objects['<here>']`). Backslashes must be escaped
-/// before single quotes, otherwise an id ending in `\` turns the closing quote
-/// into `\'` and produces a syntax error. All three objectId lookup sites route
-/// through this so they cannot diverge; not an injection vector (every `'` stays
-/// escaped, so the worst case is an unterminated string -> clean resolution
-/// failure), but a robustness fix.
-fn escape_object_id(oid: &str) -> String {
-    oid.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
 /// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
 /// and `objectId` in that order. Playwright commonly passes only `objectId`
 /// (returned by a prior `DOM.resolveNode`); without this fallback those
@@ -28,9 +17,9 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     }
     if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
         let code = format!(
-            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
+            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects[{}]; \
              return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-            escape_object_id(oid)
+            crate::util::object_id_literal(oid)
         );
         let result = page.evaluate(&code);
         let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
@@ -151,13 +140,18 @@ pub async fn handle(
             {
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-                let escaped_oid = escape_object_id(oid);
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    escaped_oid
+                    "(function() {{ var o = globalThis.__obscura_objects[{}]; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
-                result.as_f64().map(|n| n as u64).unwrap_or(0)
+                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
+                // saturate to 0 (the document root), so check before casting.
+                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+                if nid < 0 {
+                    return Err(format!("objectId {oid} could not be resolved to a node"));
+                }
+                nid as u64
             } else {
                 return Err("nodeId or objectId required".to_string());
             };
@@ -175,32 +169,22 @@ pub async fn handle(
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    escape_object_id(oid)
+                    "(function() {{ var o = globalThis.__obscura_objects[{}]; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
-                result.as_f64().map(|n| n as u64).unwrap_or(0)
+                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
+                // saturate to 0 (the document root), so check before casting.
+                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+                if nid < 0 {
+                    return Err(format!("objectId {oid} could not be resolved to a node"));
+                }
+                nid as u64
             } else {
                 return Err("nodeId or objectId required".to_string());
             };
 
-            let js_code = format!(
-                "(function() {{\
-                    var nid = {};\
-                    var node = null;\
-                    if (globalThis._cache && globalThis._cache.has(nid)) {{\
-                        node = globalThis._cache.get(nid);\
-                    }} else {{\
-                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '', globalThis.__obscura_frameId >>> 0);\
-                        if (t === 1) node = new Element(nid);\
-                        else if (t === 9) node = globalThis.document;\
-                        else node = new Node(nid);\
-                        if (globalThis._cache) globalThis._cache.set(nid, node);\
-                    }}\
-                    return node;\
-                }})()",
-                node_id,
-            );
+            let js_code = format!("globalThis._wrap({node_id})");
 
             let info = if let Some(js) = &mut page.js {
                 match js.store_object_with_meta(&js_code) {
@@ -329,7 +313,7 @@ pub async fn handle(
             let (quad, w, h) = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                 if nums.len() >= 10 {
-                    let q: Vec<Value> = nums[..8].iter().map(|n| json!(n)).collect();
+                    let q: Vec<Value> = nums[..8].iter().map(|n| coord_value(*n)).collect();
                     (q, nums[8], nums[9])
                 } else {
                     (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
@@ -343,7 +327,7 @@ pub async fn handle(
                     "padding": quad.clone(),
                     "border": quad.clone(),
                     "margin": quad,
-                    "width": w, "height": h,
+                    "width": coord_value(w), "height": coord_value(h),
                 }
             }))
         }
@@ -365,7 +349,7 @@ pub async fn handle(
             let val = page.evaluate(&code);
             let quad = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() == 8 { nums.iter().map(|n| json!(n)).collect::<Vec<_>>() }
+                if nums.len() == 8 { nums.iter().map(|n| coord_value(*n)).collect::<Vec<_>>() }
                 else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
             } else {
                 vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
@@ -373,6 +357,23 @@ pub async fn handle(
             Ok(json!({ "quads": [quad] }))
         }
         _ => Err(format!("Unknown DOM method: {}", method)),
+    }
+}
+
+/// Serialize a CDP box-model coordinate the way Chrome does: an integral double
+/// (e.g. `256.0`) becomes a JSON integer (`256`), while a genuinely fractional
+/// value (`206.0390625`) stays a float. serde_json always writes an `f64` with a
+/// decimal point, so `json!(256.0)` yields `256.0` — which strict CDP clients
+/// (Hermes Agent) deserialize as `i64` and reject, breaking every click-by-
+/// coordinate flow. Chrome only widens fractional coordinates, so mirroring that
+/// keeps those clients working. (issue #576)
+fn coord_value(n: f64) -> Value {
+    // Collapse to an integer only when the value is exactly integral and fits an
+    // i64 losslessly; NaN/inf and out-of-range doubles fall through unchanged.
+    if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        json!(n as i64)
+    } else {
+        json!(n)
     }
 }
 
@@ -524,15 +525,70 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
-    #[test]
-    fn escape_object_id_escapes_backslash_before_quote() {
-        // A trailing backslash must be doubled so it cannot escape the closing
-        // quote of __obscura_objects['...']; the old resolve_node_id path escaped
-        // only the quote, producing ['x\'] (syntax error) for the id `x\`.
-        assert_eq!(escape_object_id(r"x\"), r"x\\");
-        assert_eq!(escape_object_id("a'b"), r"a\'b");
-        assert_eq!(escape_object_id(r"a\'b"), r"a\\\'b");
-        assert_eq!(escape_object_id("plain"), "plain");
+    // The escaping this file used to own now lives in `util::object_id_literal`,
+    // which is where its tests went with it: the three lookup sites here embed
+    // the id as a JSON literal rather than splicing it into a single-quoted
+    // string, so there is no per-domain escaping left to assert on.
+
+    // A stale/invalid objectId resolves to -1 in JS. describeNode/resolveNode
+    // must surface an error, not cast -1 to nodeId 0 (the document root) and
+    // return the wrong node. See #917.
+    #[tokio::test]
+    async fn describe_node_errors_on_unresolvable_object_id() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<p>hi</p>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let res = handle(
+            "describeNode",
+            &json!({ "objectId": "no-such-object" }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "describeNode must error on an unresolvable objectId, got: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_node_errors_on_unresolvable_object_id() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<p>hi</p>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let res = handle(
+            "resolveNode",
+            &json!({ "objectId": "no-such-object" }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "resolveNode must error on an unresolvable objectId, got: {res:?}"
+        );
     }
 
     #[tokio::test]
@@ -572,6 +628,75 @@ mod tests {
             active,
             json!("INPUT"),
             "DOM.focus must set document.activeElement to the focused input"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_node_preserves_identity_and_specialized_wrappers() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        crate::domains::page::handle("navigate", &json!({
+            "url": "data:text/html,<html><body><textarea id=field></textarea><a id=link href=https://example.com>Next</a></body></html>"
+        }), &mut ctx, &session).await.unwrap();
+        for (id, constructor) in [
+            ("field", "HTMLTextAreaElement"),
+            ("link", "HTMLAnchorElement"),
+        ] {
+            let selector = format!("#{id}");
+            let query = handle(
+                "querySelector",
+                &json!({"selector": selector}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+            let resolved = handle(
+                "resolveNode",
+                &json!({"backendNodeId": query["nodeId"]}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+            let object_id = resolved["object"]["objectId"].as_str().unwrap();
+            let expression = format!(
+                "(() => {{ const node = globalThis.__obscura_objects[{}]; return node === document.getElementById({}) && node instanceof {}; }})()",
+                serde_json::to_string(object_id).unwrap(),
+                serde_json::to_string(id).unwrap(),
+                constructor
+            );
+            assert_eq!(
+                ctx.get_session_page_mut(&session)
+                    .unwrap()
+                    .evaluate(&expression),
+                json!(true)
+            );
+        }
+
+        let document = handle("getDocument", &json!({}), &mut ctx, &session)
+            .await
+            .unwrap();
+        let resolved = handle(
+            "resolveNode",
+            &json!({"nodeId": document["root"]["nodeId"]}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let object_id = resolved["object"]["objectId"].as_str().unwrap();
+        let expression = format!(
+            "globalThis.__obscura_objects[{}] === document",
+            serde_json::to_string(object_id).unwrap()
+        );
+        assert_eq!(
+            ctx.get_session_page_mut(&session)
+                .unwrap()
+                .evaluate(&expression),
+            json!(true)
         );
     }
 
@@ -760,6 +885,30 @@ mod tests {
         assert!(
             err.contains("allow-file-access"),
             "error must point at the allow-file-access flag: {err}"
+        );
+    }
+
+    // issue #576: DOM.getBoxModel / getContentQuads build their quad from f64
+    // pixel values, so serde_json emits integral coordinates as `256.0`. Strict
+    // CDP clients (Hermes Agent) deserialize the quad as i64 and reject the
+    // float. coord_value must serialize integral coordinates as integers, the way
+    // Chrome does, while leaving genuinely fractional ones as floats.
+    #[test]
+    fn box_model_integral_coordinates_serialize_as_integers() {
+        assert_eq!(serde_json::to_string(&coord_value(256.0)).unwrap(), "256");
+        assert_eq!(serde_json::to_string(&coord_value(0.0)).unwrap(), "0");
+        // fractional coordinates stay floats
+        assert_eq!(serde_json::to_string(&coord_value(206.0390625)).unwrap(), "206.0390625");
+        // a full quad mixes both, exactly as DOM.getBoxModel returns it
+        let quad: Vec<Value> = [
+            256.0, 206.0390625, 347.25, 206.0390625, 347.25, 225.0390625, 256.0, 225.0390625,
+        ]
+        .iter()
+        .map(|n| coord_value(*n))
+        .collect();
+        assert_eq!(
+            serde_json::to_string(&quad).unwrap(),
+            "[256,206.0390625,347.25,206.0390625,347.25,225.0390625,256,225.0390625]"
         );
     }
 }

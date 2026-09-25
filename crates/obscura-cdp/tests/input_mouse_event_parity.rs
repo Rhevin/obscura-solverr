@@ -19,9 +19,32 @@ async fn serve_fixture() -> String {
             #box { position: absolute; left: 20px; top: 20px; width: 180px;
                    height: 120px; overflow: auto; border: 10px solid black; }
             #inner { width: 700px; height: 800px; }
+            #hidden-y { position: absolute; left: 240px; top: 20px; width: 180px;
+                        height: 120px; overflow: auto hidden; border: 10px solid black; }
+            #hidden-inner { width: 700px; height: 800px; }
+            #hit-target { position: absolute; left: 500px; top: 20px; width: 120px;
+                          height: 60px; }
+            #hit-overlay { position: absolute; inset: 0; pointer-events: none; }
+            #offset-parent { position: relative; margin: 180px 0 0 40px;
+                             width: 120px; height: 80px; border: 3px solid black; }
+            #offset-child { position: absolute; left: -1px; top: -1px;
+                            width: 20px; height: 20px; }
+            #stack-root { position: absolute; z-index: 0; left: 650px; top: 20px;
+                          width: 120px; height: 60px; }
+            #stack-input { display: block; width: 120px; height: 60px; }
+            #stack-behind { position: absolute; z-index: -1; inset: 0; }
+            #deep-context { position: fixed; z-index: 0; left: 800px; top: 20px;
+                            width: 120px; height: 60px; }
+            #deep-target { width: 120px; height: 60px; }
+            #deep-child { display: block; width: 100%; height: 100%; }
         </style></head><body>
           <div id="page"></div>
           <div id="box"><div id="inner"></div></div>
+          <div id="hidden-y"><div id="hidden-inner"></div></div>
+          <button id="hit-target">Target<span id="hit-overlay"></span></button>
+          <div id="offset-parent"><div id="offset-child"></div></div>
+          <div id="stack-root"><input id="stack-input"><div id="stack-behind"></div></div>
+          <div id="deep-context"><button id="deep-target"><span id="deep-child">Target</span></button></div>
           <input id="check" type="checkbox">
           <form id="radio-form">
             <input id="radio-a" type="radio" name="choice" checked>
@@ -141,6 +164,41 @@ async fn wheel_over_nested_overflow_scrolls_the_nested_container() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn wheel_does_not_scroll_an_overflow_hidden_axis() {
+    let (mut ctx, sid) = setup().await;
+    let computed = evaluate(
+        &mut ctx,
+        2,
+        r#"JSON.stringify((() => {
+            const box = document.getElementById('hidden-y');
+            const style = getComputedStyle(box);
+            return { x: style.overflowX, y: style.overflowY };
+        })())"#,
+        &sid,
+    )
+    .await;
+    let computed: Value =
+        serde_json::from_str(computed["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(computed, json!({"x": "auto", "y": "hidden"}));
+
+    wheel(&mut ctx, 3, &sid, 270.0, 50.0, 0.0, 110.0).await;
+    let result = evaluate(
+        &mut ctx,
+        4,
+        r#"JSON.stringify({
+            rootY: scrollY,
+            hiddenY: document.getElementById('hidden-y').scrollTop
+        })"#,
+        &sid,
+    )
+    .await;
+    let state: Value =
+        serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state["rootY"], 110.0, "hidden Y overflow must chain to the viewport");
+    assert_eq!(state["hiddenY"], 0.0, "wheel input must not scroll a hidden axis");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn wheel_offsets_clamp_to_nested_scroll_extents() {
     let (mut ctx, sid) = setup().await;
     wheel(&mut ctx, 2, &sid, 50.0, 50.0, 100_000.0, 100_000.0).await;
@@ -222,9 +280,17 @@ async fn canceling_wheel_prevents_its_scroll_default() {
 #[tokio::test(flavor = "current_thread")]
 async fn hit_testing_clips_scrolled_children_at_overflow_padding_edge() {
     let (mut ctx, sid) = setup().await;
-    let result = evaluate(
+    let visible = evaluate(
         &mut ctx,
         2,
+        "document.elementFromPoint(50, 50).id",
+        &sid,
+    )
+    .await;
+    assert_eq!(visible["result"]["value"], "inner");
+    let result = evaluate(
+        &mut ctx,
+        3,
         r#"(() => {
             const box = document.getElementById('box');
             box.scrollLeft = 50;
@@ -246,6 +312,77 @@ async fn hit_testing_clips_scrolled_children_at_overflow_padding_edge() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hit_testing_ignores_pointer_events_none_overlay() {
+    let (mut ctx, sid) = setup().await;
+    let result = evaluate(
+        &mut ctx,
+        2,
+        r#"JSON.stringify({
+            hit: document.elementFromPoint(550, 50).id,
+            overlayPointerEvents: getComputedStyle(document.getElementById('hit-overlay')).pointerEvents
+        })"#,
+        &sid,
+    )
+    .await;
+    let result: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(result, json!({"hit": "hit-target", "overlayPointerEvents": "none"}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hit_testing_respects_negative_stacking_layers() {
+    let (mut ctx, sid) = setup().await;
+    let result = evaluate(
+        &mut ctx,
+        2,
+        "document.elementFromPoint(710, 50).id",
+        &sid,
+    )
+    .await;
+    assert_eq!(result["result"]["value"], "stack-input");
+
+    let nested = evaluate(
+        &mut ctx,
+        3,
+        "document.elementFromPoint(860, 50).id",
+        &sid,
+    )
+    .await;
+    assert_eq!(nested["result"]["value"], "deep-child");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn offset_geometry_is_relative_to_the_positioned_ancestor() {
+    let (mut ctx, sid) = setup().await;
+    let result = evaluate(
+        &mut ctx,
+        2,
+        r#"JSON.stringify((() => {
+            const parent = document.getElementById('offset-parent');
+            const child = document.getElementById('offset-child');
+            const parentRect = parent.getBoundingClientRect();
+            const childRect = child.getBoundingClientRect();
+            return {
+                parent: child.offsetParent === parent,
+                left: child.offsetLeft,
+                top: child.offsetTop,
+                expectedLeft: Math.round(childRect.left - parentRect.left - parent.clientLeft),
+                expectedTop: Math.round(childRect.top - parentRect.top - parent.clientTop),
+                clientLeft: parent.clientLeft,
+                clientTop: parent.clientTop
+            };
+        })())"#,
+        &sid,
+    )
+    .await;
+    let result: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(result["parent"], true);
+    assert_eq!(result["left"], result["expectedLeft"]);
+    assert_eq!(result["top"], result["expectedTop"]);
+    assert_eq!(result["clientLeft"], 3);
+    assert_eq!(result["clientTop"], 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn press_release_orders_events_and_defers_click_activation() {
     let (mut ctx, sid) = setup().await;
     evaluate(
@@ -255,10 +392,16 @@ async fn press_release_orders_events_and_defers_click_activation() {
             const target = document.getElementById('check');
             document.elementFromPoint = () => target;
             globalThis.mouseLog = [];
-            for (const type of ['mousedown', 'mouseup', 'click', 'input', 'change']) {
+            for (const type of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter',
+                                'pointerdown', 'mousedown', 'focus', 'focusin',
+                                'pointerup', 'mouseup', 'click', 'input', 'change']) {
                 target.addEventListener(type, event => mouseLog.push({
                     type, checked: target.checked, x: event.clientX,
-                    ctrl: event.ctrlKey, shift: event.shiftKey, trusted: event.isTrusted
+                    pointerType: event.pointerType || '',
+                    ctrl: event.ctrlKey, shift: event.shiftKey, trusted: event.isTrusted,
+                    detail: event.detail, which: event.which,
+                    offsetX: event.offsetX, offsetY: event.offsetY,
+                    modifierCtrl: event.getModifierState?.('Control')
                 }));
             }
         })()"#,
@@ -286,8 +429,33 @@ async fn press_release_orders_events_and_defers_click_activation() {
     .await;
     let pressed: Value = serde_json::from_str(pressed["result"]["value"].as_str().unwrap()).unwrap();
     assert_eq!(pressed["checked"], false, "checkbox activation must wait for release");
-    assert_eq!(pressed["log"][0]["type"], "mousedown");
-    assert_eq!(pressed["log"].as_array().unwrap().len(), 1, "press must not synthesize click");
+    let pressed_types: Vec<&str> = pressed["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        pressed_types,
+        [
+            "pointerover",
+            "pointerenter",
+            "mouseover",
+            "mouseenter",
+            "pointerdown",
+            "mousedown",
+            "focus",
+            "focusin"
+        ]
+    );
+    assert_eq!(pressed["log"][4]["pointerType"], "mouse");
+    assert_eq!(pressed["log"][4]["detail"], 0);
+    assert_eq!(pressed["log"][5]["detail"], 1);
+    assert_eq!(pressed["log"][5]["which"], 1);
+    assert!(pressed["log"][5]["offsetX"].is_number());
+    assert!(pressed["log"][5]["offsetY"].is_number());
+    assert_eq!(pressed["log"][5]["modifierCtrl"], true);
+    assert_eq!(pressed["log"][6]["trusted"], true);
 
     cdp(
         &mut ctx,
@@ -314,13 +482,30 @@ async fn press_release_orders_events_and_defers_click_activation() {
         .iter()
         .map(|entry| entry["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["mousedown", "mouseup", "click", "input", "change"]);
+    assert_eq!(
+        types,
+        [
+            "pointerover",
+            "pointerenter",
+            "mouseover",
+            "mouseenter",
+            "pointerdown",
+            "mousedown",
+            "focus",
+            "focusin",
+            "pointerup",
+            "mouseup",
+            "click",
+            "input",
+            "change"
+        ]
+    );
     assert_eq!(released["checked"], true);
-    assert_eq!(released["log"][2]["checked"], true, "click sees checkbox pre-activation");
-    assert_eq!(released["log"][2]["x"], 31.0);
-    assert_eq!(released["log"][2]["ctrl"], true);
-    assert_eq!(released["log"][2]["shift"], true);
-    assert_eq!(released["log"][2]["trusted"], true);
+    assert_eq!(released["log"][10]["checked"], true, "click sees checkbox pre-activation");
+    assert_eq!(released["log"][10]["x"], 31.0);
+    assert_eq!(released["log"][10]["ctrl"], true);
+    assert_eq!(released["log"][10]["shift"], true);
+    assert_eq!(released["log"][10]["trusted"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -160,7 +160,7 @@ impl BrowserContext {
     pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
         if persistent {
-            cookie_jar.set_cookies_from_cdp(self.cookie_jar.get_all_cookies());
+            cookie_jar.copy_from(&self.cookie_jar);
         }
 
         let mut client = ObscuraHttpClient::with_full_options(
@@ -260,6 +260,10 @@ mod tests {
 
         assert_eq!(persistent.cookie_jar.get_all_cookies().len(), 1);
         assert!(incognito.cookie_jar.get_all_cookies().is_empty());
+        assert!(persistent
+            .cookie_jar
+            .get_cookie_header(&url::Url::parse("https://sub.example.com").unwrap())
+            .is_empty());
         persistent.cookie_jar.clear();
         persistent.http_client.set_user_agent("Changed-UA/2.0").await;
 

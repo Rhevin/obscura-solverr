@@ -65,6 +65,10 @@ impl FrameRealm {
             return None;
         }
         parent.copy_identity_to_realm(&context);
+        // A snapshot-created realm has null deno_core per-context state slots, so
+        // a promise rejection or dynamic import() in the frame would segfault in
+        // deno_core's global callbacks (#850, #841). Alias the main realm's state.
+        parent.share_deno_context_state_with_realm(&context);
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
@@ -135,9 +139,10 @@ impl FrameRealm {
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              globalThis.__documentReadyState__ = 'complete';\
              try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
-             if (typeof window.onload === 'function') { try { window.onload(); } catch (_) {} }\
-             try { window.dispatchEvent(new Event('load', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}",
+             try { const loadEvent = new Event('load', \
+                 { bubbles: false, cancelable: false }); \
+                 if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
+                 try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
         )
     }
 
@@ -148,13 +153,15 @@ impl FrameRealm {
         data_json: &str,
         origin: &str,
         source_frame_id: u32,
+        target_origin: &str,
     ) -> Result<(), String> {
         self.execute_script(
             parent,
             &format!(
-                "globalThis.__obscura_deliverMessage({}, {}, {source_frame_id});",
+                "globalThis.__obscura_deliverMessage({}, {}, {source_frame_id}, {});",
                 encode_json_argument(data_json),
                 encode_json_argument(origin),
+                encode_json_argument(target_origin),
             ),
         )
     }
@@ -439,8 +446,8 @@ mod tests {
         assert!(frame.is_same_origin_as("https://child.example"));
     }
 
-    #[test]
-    fn frame_uses_its_embedding_viewport() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_uses_its_embedding_viewport() {
         let mut parent = page(
             "https://parent.example/page",
             "<html><body><iframe style='width:300px;height:65px'></iframe></body></html>",
@@ -468,8 +475,8 @@ mod tests {
 
     /// A frame must not look like a different browser than its parent. Anti-bot
     /// code fingerprints inside the frame and compares it with the top document.
-    #[test]
-    fn frame_inherits_the_parent_browser_identity() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_inherits_the_parent_browser_identity() {
         let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TestAgent/150.0.0.0";
         let mut parent = ObscuraJsRuntime::new();
         parent.set_user_agent(user_agent);
@@ -557,6 +564,161 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_posted_task_runs_in_its_creation_realm() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            "<html><body><output id='result'>pending</output></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.__obscura_frameId = 0;\
+                 scheduler.postTask(() => {\
+                   document.getElementById('result').textContent = location.origin;\
+                 });",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "document.getElementById('result').textContent",
+                )
+                .unwrap(),
+            serde_json::json!("https://child.example"),
+        );
+        assert_eq!(
+            parent.evaluate("document.body.innerHTML").unwrap(),
+            serde_json::json!("")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_frame_cancels_its_queued_posted_task() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body data-owner='parent'></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><body data-owner='frame'></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "const staleController = new AbortController();\
+                 globalThis.__staleController = staleController;\
+                 staleController.signal.removeEventListener = () => {\
+                   document.body.setAttribute('data-stale-cleanup', 'ran');\
+                   parent.postMessage('stale-cleanup', '*');\
+                 };\
+                 scheduler.postTask(() => {\
+                   document.body.setAttribute('data-stale-task', 'ran');\
+                   parent.postMessage('stale-posted-task', '*');\
+                 }, { signal: staleController.signal });\
+                 setTimeout(() => scheduler.postTask(() => {\
+                   document.body.setAttribute('data-delayed-stale-task', 'ran');\
+                   parent.postMessage('delayed-stale-posted-task', '*');\
+                 }), 1);",
+            )
+            .unwrap();
+        drop(frame);
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        assert!(
+            parent.take_pending_frame_messages().is_empty(),
+            "a posted task from the detached frame still executed",
+        );
+
+        assert_eq!(
+            parent.evaluate("document.body.getAttribute('data-owner')").unwrap(),
+            serde_json::json!("parent"),
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-delayed-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-stale-cleanup')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate(
+                    "(function(){\
+                       const window = globalThis.__obscura_frameObjects[1]?.window;\
+                       const controller = window?.__staleController;\
+                       return [typeof window, typeof controller,\
+                         controller?.signal?._listeners?.length];\
+                     })()",
+                )
+                .unwrap(),
+            serde_json::json!(["object", "object", 0]),
+            "the retained frame realm did not discard its scheduler listener",
+        );
+    }
+
+    #[test]
+    fn frame_body_onload_content_attribute_reflects_to_window() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            r#"<html><body onload="
+                globalThis.__frameBodyOnload = [this === window, event.type];
+                throw new Error('frame body onload failure');
+            "><script>
+                globalThis.__frameBodyOnload = null;
+                globalThis.__frameLoadListenerCalls = 0;
+                window.addEventListener('load', () => __frameLoadListenerCalls++);
+            </script></body></html>"#,
+        )
+        .expect("frame realm");
+
+        assert!(frame
+            .run_document_scripts(&mut parent, |_| None)
+            .is_empty());
+        frame
+            .dispatch_load_events(&mut parent)
+            .expect("frame load events");
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__frameBodyOnload, globalThis.__frameLoadListenerCalls]",
+                )
+                .unwrap(),
+            serde_json::json!([[true, "load"], 1]),
+        );
+    }
+
     #[test]
     fn one_bad_frame_script_does_not_stop_the_rest() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
@@ -590,8 +752,8 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("module")), "{problems:?}");
     }
 
-    #[test]
-    fn many_frames_can_be_alive_at_once() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn many_frames_can_be_alive_at_once() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frames: Vec<FrameRealm> = (0..4)
             .map(|index| {
@@ -756,6 +918,46 @@ mod tests {
         );
     }
 
+    // #850 / #841 — a promise rejection or dynamic import() inside a frame realm
+    // used to null-deref deno_core's global callbacks (which read per-context
+    // state from V8 embedder slots) and segfault the whole process. The realm
+    // must now alias the main realm's state so these run without crashing.
+    #[test]
+    fn a_frame_rejection_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        // Reaching this line at all (no SIGSEGV) is the regression check.
+        frame
+            .execute_script(&mut parent, "Promise.reject(new Error('boom')); 'ok'")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_frame_dynamic_import_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(
+                &mut parent,
+                "import('data:text/javascript,export default 1').catch(() => {}); 'ok'",
+            )
+            .unwrap();
+    }
+
     /// A frame posting to `parent` must reach the page, arrive trusted, and
     /// carry the frame's origin. Turnstile and every widget like it drop an
     /// untrusted message silently, so an untrusted delivery is not a cosmetic
@@ -799,6 +1001,146 @@ mod tests {
         assert_eq!(
             parent.evaluate("globalThis.got").unwrap(),
             serde_json::json!([[{"token": "ok"}, "https://child.example", true]]),
+        );
+    }
+
+    /// SEC-001 / #704 — postMessage must honour `targetOrigin`. A message
+    /// restricted to a specific origin must be dropped when the receiving realm
+    /// has a different origin, and delivered when the origins match. Before the
+    /// fix the argument was discarded end-to-end, so the first message leaked.
+    #[test]
+    fn post_message_honours_target_origin() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent
+            .execute_script(
+                "p",
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push([e.data, e.origin]));",
+            )
+            .unwrap();
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        // Deliver the way `Page` does, now carrying the queued targetOrigin.
+        let deliver = |parent: &mut ObscuraJsRuntime, m: &crate::ops::PendingFrameMessage| {
+            let script = format!(
+                "globalThis.__obscura_deliverMessage({}, {}, {}, {});",
+                serde_json::to_string(&m.data_json).unwrap(),
+                serde_json::to_string(&m.origin).unwrap(),
+                m.source_frame_id,
+                serde_json::to_string(&m.target_origin).unwrap(),
+            );
+            parent.execute_script("<frame-message>", &script).unwrap();
+        };
+
+        // Restricted to an origin the parent does NOT have -> must be dropped.
+        frame
+            .execute_script(
+                &mut parent,
+                "parent.postMessage({token: 'secret'}, 'https://attacker.example');",
+            )
+            .unwrap();
+        let queued = parent.take_pending_frame_messages();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].target_origin, "https://attacker.example");
+        deliver(&mut parent, &queued[0]);
+        assert_eq!(
+            parent.evaluate("globalThis.got").unwrap(),
+            serde_json::json!([]),
+            "a message whose targetOrigin does not match the receiver must be dropped",
+        );
+
+        // Restricted to the parent's real origin -> must be delivered.
+        frame
+            .execute_script(
+                &mut parent,
+                "parent.postMessage({token: 'ok'}, 'https://parent.example');",
+            )
+            .unwrap();
+        let queued = parent.take_pending_frame_messages();
+        deliver(&mut parent, &queued[0]);
+        assert_eq!(
+            parent.evaluate("globalThis.got").unwrap(),
+            serde_json::json!([[{"token": "ok"}, "https://child.example"]]),
+            "a message whose targetOrigin matches the receiver must be delivered",
+        );
+    }
+
+    /// SEC-001 / #704 — verifies the targetOrigin gate does NOT break legitimate
+    /// delivery *into* a frame (the "about:blank / empty origin" regression a
+    /// reviewer warned about): an explicit origin that matches the loaded frame
+    /// is delivered, the wildcard is always delivered (including to an opaque
+    /// about:blank frame), and only a genuine mismatch is dropped.
+    #[test]
+    fn post_message_into_a_frame_does_not_over_drop() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+
+        // A loaded, same-origin child frame.
+        let child = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        child
+            .execute_script(
+                &mut parent,
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push(String(e.data)));",
+            )
+            .unwrap();
+
+        // Explicit matching origin -> delivered (the case that must not break).
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m1\"}", "https://parent.example", 0, "https://parent.example")
+            .unwrap();
+        // Wildcard -> always delivered.
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m2\"}", "https://parent.example", 0, "*")
+            .unwrap();
+        // Explicit non-matching origin -> dropped.
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m3\"}", "https://parent.example", 0, "https://evil.example")
+            .unwrap();
+
+        assert_eq!(
+            child.evaluate(&mut parent, "globalThis.got").unwrap(),
+            serde_json::json!(["m1", "m2"]),
+            "matching origin and wildcard must deliver into the frame; only a real mismatch drops",
+        );
+
+        // An opaque (about:blank) frame: the wildcard must still deliver, so the
+        // common widget case never breaks even when the frame origin is 'null'.
+        let blank = FrameRealm::new(
+            &mut parent,
+            2,
+            0,
+            "about:blank",
+            "<html><body></body></html>",
+        )
+        .expect("blank frame realm");
+        blank
+            .execute_script(
+                &mut parent,
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push(String(e.data)));",
+            )
+            .unwrap();
+        blank
+            .deliver_message(&mut parent, "{\"v\":\"w\"}", "https://parent.example", 0, "*")
+            .unwrap();
+        assert_eq!(
+            blank.evaluate(&mut parent, "globalThis.got").unwrap(),
+            serde_json::json!(["w"]),
+            "the wildcard must still deliver to an about:blank (opaque-origin) frame",
         );
     }
 

@@ -531,6 +531,26 @@ fn inset_absolute_uses_nearest_positioned_ancestor() {
 }
 
 #[test]
+fn inset_absolute_fills_positioned_inline_flex_ancestor() {
+    let tree = parse_html(
+        r#"<body style="margin:0">
+          <div style="display:flex">
+            <div id="button" style="position:relative;display:inline-flex;width:115px;height:40px;padding:0 12px;box-sizing:border-box">
+              <a id="overlay" style="position:absolute;inset:unset;top:50%;left:50%;width:max(48px,100%);height:max(48px,100%);transform:translate(-50%,-50%)"></a>
+            </div>
+          </div>
+        </body>"#,
+    );
+    let layout = layout_dom(&tree, (1120.0, 780.0));
+    let button = layout.rects[&tree.get_element_by_id("button").unwrap()];
+    let overlay = layout.rects[&tree.get_element_by_id("overlay").unwrap()];
+
+    assert_eq!((button.width, button.height), (115.0, 40.0));
+    assert_eq!(overlay.width, 91.0);
+    assert_eq!(overlay.height, 48.0, "functional percentage height must use the 40px containing block");
+}
+
+#[test]
 fn absolute_auto_axes_preserve_static_position_after_reparenting() {
     let tree = parse_html(include_str!("../../../render-repros/absolute-static-position.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
@@ -3487,6 +3507,36 @@ fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum()
     }
 }
 
+#[test]
+fn cyclic_percentage_flex_row_keeps_its_intrinsic_content_width() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #scroller { display:flex; width:768px }
+          #month { flex:0 0 auto; width:auto; max-width:336px; padding:0 24px }
+          #week { display:flex; width:100% }
+          .day { flex:1 0 48px; width:48px; height:48px }
+        </style>
+        <div id="scroller"><div id="month"><div><div id="week">
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div>
+        </div></div></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(rect("week").width, 336.0, "percentage row: {:?}", rect("week"));
+    assert_eq!(
+        rect("month").width,
+        384.0,
+        "content width plus inline padding: {:?}",
+        rect("month")
+    );
+}
+
 /// Chromium resolves both spellings to the same 163px content width: the
 /// percentage is cyclic while the link's flex-item width is being measured,
 /// then resolves against that link's final width. Carbon Ads uses the bare
@@ -4470,4 +4520,55 @@ fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     assert_eq!(size("justify-start"), (400.0, 200.0));
     assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
     assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
+}
+
+#[test]
+fn deeply_nested_wrappers_cascade_without_stack_overflow() {
+    // The style cascade used to recurse once per DOM level with a fat frame,
+    // so a page-controlled tree a few dozen levels deep overflowed the native
+    // stack and aborted the process. The traversal is iterative now; depth
+    // must change neither survival nor rule matching.
+    let open: String = (0..400).map(|_| "<span>").collect::<Vec<_>>().join("");
+    let close = "</span>".repeat(400);
+    let tree = parse_html(&format!(
+        r#"<style>
+          html, body {{ margin:0; font:16px/18px monospace }}
+          div span #deep {{ display:block; width:50px }}
+        </style>
+        <div>{open}<span id="deep">deep</span>{close}<input type="checkbox"></div>"#
+    ));
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let rect = layout.rects[&tree.get_element_by_id("deep").unwrap()];
+    // A descendant-combinator match at depth 400: the matcher's ancestor
+    // filter is maintained across the whole iterative walk.
+    assert!(
+        (rect.width - 50.0).abs() < 0.01,
+        "the descendant rule must match at depth 400, got {rect:?}"
+    );
+}
+
+#[test]
+fn float_ending_at_rounded_segment_boundary_does_not_panic() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    fn place(
+        context: &mut FloatContext,
+        height: f32,
+        direction: FloatDirection,
+    ) -> taffy::Point<f32> {
+        context.place_floated_box(
+            Size { width: 100.0, height },
+            1859.0,
+            [0.0, 0.0],
+            direction,
+            Clear::None,
+        )
+    }
+
+    let mut context = FloatContext::new();
+    context.set_width(1000.0);
+    place(&mut context, 421.3333, FloatDirection::Left);
+    place(&mut context, 400.3333, FloatDirection::Right);
+
+    assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
