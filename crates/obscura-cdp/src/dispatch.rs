@@ -9,6 +9,10 @@ use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
+pub(crate) const LIFECYCLE_PHASES: [&str; 5] = [
+    "commit", "DOMContentLoaded", "load", "networkAlmostIdle", "networkIdle",
+];
+
 #[cfg(feature = "render")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScreencastFormat {
@@ -64,6 +68,8 @@ pub struct CdpContext {
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
     pub pending_events: Vec<CdpEvent>,
+    pub(crate) dom_documents: HashMap<Option<String>, domains::dom::DomDocument>,
+    pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
     #[cfg(feature = "render")]
@@ -74,6 +80,7 @@ pub struct CdpContext {
     browser_context_counter: u32,
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
+    pub(crate) preload_script_pages: HashMap<String, String>,
     pub preload_counter: u32,
     // Which sessions asked for each `Runtime.addBinding` name. A binding is a
     // session-scoped subscription in CDP, and a client discards any event whose
@@ -84,6 +91,11 @@ pub struct CdpContext {
     /// Sessions that called Runtime.enable. Console and exception events are
     /// page-scoped but only delivered to these subscribers.
     pub runtime_enabled_sessions: HashSet<String>,
+    /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
+    pub(crate) lifecycle_enabled_sessions: HashSet<String>,
+    /// Reached phases of the current main-frame document, retained for late
+    /// subscribers even when no session was listening at completion time.
+    pub(crate) lifecycle_timestamps: HashMap<String, [Option<f64>; 5]>,
     // Legacy direct-embedder configuration. Protocol-created worlds live only
     // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
@@ -176,6 +188,8 @@ impl CdpContext {
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
+            dom_documents: HashMap::new(),
+            pending_beforeunload_close: HashMap::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
             #[cfg(feature = "render")]
@@ -186,8 +200,11 @@ impl CdpContext {
             browser_context_counter: 0,
             target_session_counter: 0,
             preload_scripts: Vec::new(),
+            preload_script_pages: HashMap::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
+            lifecycle_enabled_sessions: HashSet::new(),
+            lifecycle_timestamps: HashMap::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -219,7 +236,7 @@ impl CdpContext {
             storage_dir,
             allow_private_network,
         );
-        ctx.allow_file_access = allow_file_access;
+        ctx.set_allow_file_access(allow_file_access);
         Self::new_with_shared_context(Arc::new(ctx))
     }
 
@@ -259,6 +276,7 @@ impl CdpContext {
         self.pages.push(page);
         self.current_loader_ids
             .insert(page_id.clone(), format!("loader-blank-{page_id}"));
+        self.lifecycle_timestamps.insert(page_id.clone(), [Some(domains::page::timestamp()); 5]);
         Ok(page_id)
     }
 
@@ -327,7 +345,19 @@ impl CdpContext {
         }
     }
 
+    // Runtime binding shims have no target owner; Page scripts do.
+    pub(crate) fn preload_sources_for_page(&self, page_id: &str) -> Vec<String> {
+        self.preload_scripts.iter()
+            .filter(|(id, _)| self.preload_script_pages.get(id).is_none_or(|owner| owner == page_id))
+            .map(|(_, source)| source.clone()).collect()
+    }
+
     pub fn remove_page(&mut self, id: &str) {
+        self.preload_scripts.retain(|(script_id, _)|
+            self.preload_script_pages.get(script_id).is_none_or(|owner| owner != id));
+        self.preload_script_pages.retain(|_, owner| owner != id);
+        self.dom_documents.retain(|_, document| document.page_id != id);
+        self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()
@@ -336,7 +366,13 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.lifecycle_timestamps.remove(id);
+        self.nav_events_emitted.remove(id);
         self.announced_frames.remove(id);
+        self.binding_sessions.retain(|_, owners| {
+            owners.retain(|owner| !removed_sessions.contains(owner));
+            !owners.is_empty()
+        });
         #[cfg(feature = "render")]
         {
             for session_id in &removed_sessions {
@@ -345,6 +381,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.lifecycle_enabled_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -389,13 +426,21 @@ impl CdpContext {
     }
 
     pub(crate) fn ensure_default_context(&mut self, page_id: &str) -> Option<ExecutionContextRecord> {
-        if let Some(context) = self.contexts_for_page(page_id).into_iter().find(|context| context.is_default) {
-            return Some(context.clone());
-        }
         let page = self.get_page(page_id)?;
         let frame_id = page.frame_id.clone();
         let origin = page.url_string();
-        Some(self.allocate_context(page_id, &frame_id, &origin, "", true))
+        Some(self.ensure_frame_default_context(page_id, &frame_id, &origin).0)
+    }
+
+    fn ensure_frame_default_context(
+        &mut self, page_id: &str, frame_id: &str, origin: &str,
+    ) -> (ExecutionContextRecord, bool) {
+        if let Some(context) = self.contexts_for_page(page_id)
+            .find(|context| context.is_default && context.frame_id == frame_id)
+        {
+            return (context.clone(), false);
+        }
+        (self.allocate_context(page_id, frame_id, origin, "", true), true)
     }
 
     /// The single hook for an installed replacement Document.
@@ -405,6 +450,14 @@ impl CdpContext {
         frame_id: &str,
         origin: &str,
     ) -> Vec<ExecutionContextRecord> {
+        self.announced_frames.remove(page_id);
+        self.dom_documents.retain(|session, document| {
+            if document.page_id != page_id { return true; }
+            self.pending_events.push(CdpEvent {
+                method: "DOM.documentUpdated".into(), params: json!({}), session_id: session.clone(),
+            });
+            false
+        });
         if let Some(previous) = self.page_contexts.remove(page_id) {
             for id in previous {
                 self.execution_contexts.remove(&id);
@@ -470,8 +523,10 @@ impl CdpContext {
     }
 
     pub(crate) fn default_context_id(&self, page_id: &str) -> Option<i64> {
+        let frame_id = &self.get_page(page_id)?.frame_id;
         self.contexts_for_page(page_id)
-            .find(|context| context.is_default).map(|context| context.id)
+            .find(|context| context.is_default && &context.frame_id == frame_id)
+            .map(|context| context.id)
     }
 
     fn remove_frame_contexts(
@@ -673,9 +728,9 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.getFrameTree"
             | "Page.setDownloadBehavior"
             | "Page.setLifecycleEventsEnabled"
-            | "Page.addScriptToEvaluateOnNewDocument"
             | "Page.removeScriptToEvaluateOnNewDocument"
             | "Page.setInterceptFileChooserDialog"
+            | "Page.setBypassCSP"
             | "Page.getNavigationHistory"
             | "Page.resetNavigationHistory"
             | "Page.captureSnapshot"
@@ -715,6 +770,14 @@ fn is_v8_free_method(method: &str) -> bool {
 }
 
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    dispatch_with_deferred(req, ctx, None).await
+}
+
+pub(crate) async fn dispatch_with_deferred(
+    req: &CdpRequest,
+    ctx: &mut CdpContext,
+    deferred: Option<&mut Option<domains::runtime::DeferredEvaluation>>,
+) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
     // per-connection V8 lock — the recursive dispatch will acquire it for the
@@ -794,6 +857,18 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "DOMSnapshot" => {
             domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await
         }
+        "Runtime" if deferred.is_some() && matches!(method, "evaluate" | "callFunctionOn")
+            && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true) => {
+            match domains::runtime::start_awaited_evaluation(method, &req.params, ctx, &req.session_id, cmd_budget_ms).await {
+                Ok(Some(evaluation)) if evaluation.ready(ctx) => evaluation.finish(ctx, &req.session_id).await,
+                Ok(Some(evaluation)) => {
+                    *deferred.unwrap() = Some(evaluation);
+                    Ok(json!({}))
+                }
+                Ok(None) => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
+                Err(error) => Err(error),
+            }
+        }
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
@@ -805,6 +880,15 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Accessibility" => {
             domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
         }
+        "HeapProfiler" if method == "collectGarbage" => {
+            match ctx.get_session_page_mut(&req.session_id).and_then(|page| page.js.as_mut()) {
+                Some(js) => {
+                    js.collect_garbage();
+                    Ok(json!({}))
+                }
+                None => Err("No JavaScript runtime".to_string()),
+            }
+        }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
@@ -814,13 +898,10 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     #[cfg(feature = "render")]
-    if result.is_ok() && domains::page::command_can_change_screencast_frame(&req.method) {
-        if let Err(error) = domains::page::queue_screencast_frame(ctx, &req.session_id, false) {
-            // Frame delivery is an asynchronous side effect in Chromium; it
-            // must not rewrite an otherwise successful command response.
-            tracing::warn!(method = %req.method,
-                "could not produce command-driven screencast frame: {error}");
-        }
+    if result.is_ok()
+        && domains::page::command_can_change_screencast_frame(&req.method)
+    {
+        domains::page::schedule_screencast_frame(ctx, &req.session_id);
     }
 
     // Stop the per-command watchdog. If it fired (the handler held V8 past the
@@ -856,6 +937,19 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
     let mut drained = Vec::new();
     for page in &mut ctx.pages {
         let runtime_events = page.take_pending_runtime_events();
+        for event in &runtime_events {
+            if let obscura_js::ops::RuntimeEvent::DocumentLifecycle { name, timestamp } = event {
+                if let Some(timings) = ctx.lifecycle_timestamps.get_mut(&page.id) {
+                    if name == "init" {
+                        // document.open() retains its loader but starts a new
+                        // document; its predecessor's completion is not replayable.
+                        timings[1..].fill(None);
+                    } else if let Some(index) = LIFECYCLE_PHASES.iter().position(|phase| phase == name) {
+                        timings[index] = Some(*timestamp);
+                    }
+                }
+            }
+        }
         if !runtime_events.is_empty() {
             drained.push((page.id.clone(), runtime_events));
         }
@@ -865,7 +959,7 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
     }
 
     let mut page_to_sessions: HashMap<&str, Vec<&str>> = HashMap::new();
-    for session_id in &ctx.runtime_enabled_sessions {
+    for session_id in ctx.runtime_enabled_sessions.union(&ctx.lifecycle_enabled_sessions) {
         if let Some(page_id) = ctx.sessions.get(session_id) {
             page_to_sessions
                 .entry(page_id.as_str())
@@ -883,8 +977,25 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
         };
         let execution_context_id = ctx.default_context_id(&page_id).unwrap_or(1);
         for runtime_event in runtime_events {
+            let subscribers = if matches!(&runtime_event, obscura_js::ops::RuntimeEvent::DocumentLifecycle { .. }) {
+                &ctx.lifecycle_enabled_sessions
+            } else {
+                &ctx.runtime_enabled_sessions
+            };
             for session_id in sessions {
+                if !subscribers.contains(*session_id) {
+                    continue;
+                }
                 let (method, params) = match &runtime_event {
+                    obscura_js::ops::RuntimeEvent::DocumentLifecycle { name, timestamp } => (
+                        "Page.lifecycleEvent",
+                        json!({
+                            "frameId": ctx.pages.iter().find(|page| page.id == page_id).map(|page| &page.frame_id),
+                            "loaderId": ctx.current_loader_ids.get(&page_id),
+                            "name": name,
+                            "timestamp": timestamp,
+                        }),
+                    ),
                     obscura_js::ops::RuntimeEvent::Console(event) => (
                         "Runtime.consoleAPICalled",
                         json!({
@@ -1032,6 +1143,7 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
     let mut events: Vec<CdpEvent> = Vec::new();
     let mut announced: HashMap<String, Vec<String>> = HashMap::new();
     let mut detached = Vec::new();
+    let mut frame_contexts = Vec::new();
     for page in &ctx.pages {
         let Some(session_ids) = page_to_sessions.get(&page.id) else {
             continue;
@@ -1048,6 +1160,10 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
                 continue;
             }
+            frame_contexts.push((
+                page.id.clone(), id.to_string(),
+                frame["url"].as_str().unwrap_or_default().to_string(),
+            ));
             for session_id in session_ids {
                 // Attach before navigate: a client builds its frame from the
                 // attach event and treats a navigation of a frame it has never
@@ -1083,6 +1199,33 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             }
         }
         announced.insert(page.id.clone(), live_ids);
+    }
+    for (page_id, frame_id, origin) in frame_contexts {
+        let (context, created) = ctx.ensure_frame_default_context(&page_id, &frame_id, &origin);
+        if created {
+            let mut contexts = vec![context];
+            let mut worlds = ctx.isolated_worlds.clone();
+            if let Some(page_worlds) = ctx.page_isolated_worlds.get(&page_id) {
+                for world in page_worlds {
+                    if !worlds.contains(world) { worlds.push(world.clone()); }
+                }
+            }
+            for world in worlds {
+                if world.is_empty() { continue; }
+                let (context, _) = ctx.create_isolated_context(
+                    &page_id, &frame_id, &origin, &world, false,
+                );
+                contexts.push(context);
+            }
+            let sessions = ctx.runtime_sessions_for_page(&page_id);
+            for context in contexts {
+                for session_id in &sessions {
+                    events.push(crate::domains::runtime::execution_context_created_event(
+                        &context, Some(session_id.clone()),
+                    ));
+                }
+            }
+        }
     }
     for (page_id, frame_id, page_sessions) in detached {
         let removed = ctx.remove_frame_contexts(&page_id, &frame_id);
@@ -1182,6 +1325,44 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_page_releases_per_page_connection_state() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions.insert("s1".into(), page_id.clone());
+        ctx.nav_events_emitted.insert(page_id.clone());
+        ctx.binding_sessions.insert("only".into(), vec!["s1".into()]);
+        ctx.binding_sessions.insert("shared".into(), vec!["s1".into(), "other".into()]);
+        ctx.remove_page(&page_id);
+        assert!(ctx.nav_events_emitted.is_empty());
+        assert!(ctx.lifecycle_timestamps.is_empty());
+        assert!(!ctx.binding_sessions.contains_key("only"));
+        assert_eq!(ctx.binding_sessions["shared"], vec!["other".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn heap_profiler_collect_garbage_reclaims_unreferenced_objects() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("heap-gc".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap().execute_script("gc-allocations",
+            "globalThis.garbage = Array.from({length: 200000}, (_, i) => ({i}));",
+        ).unwrap();
+        let before = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        ctx.get_session_page_mut(&session).unwrap().evaluate("globalThis.garbage = null");
+        let response = dispatch(&CdpRequest {
+            session_id: session.clone(),
+            ..req("HeapProfiler.collectGarbage")
+        }, &mut ctx).await;
+        assert!(response.error.is_none(), "GC request failed: {:?}", response.error);
+        let after = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        assert!(after + 2 * 1024 * 1024 < before,
+            "explicit GC must reclaim discarded objects: {before} -> {after}");
+    }
+
     #[tokio::test]
     async fn audits_enable_returns_empty_success() {
         let mut ctx = CdpContext::new();
@@ -1194,6 +1375,32 @@ mod tests {
         assert_eq!(resp.result, Some(json!({})));
     }
 
+    // Playwright sends Page.setBypassCSP for every new page of a context
+    // created with `bypassCSP: true`; an unknown-method error there fails
+    // page creation outright (changedetection.io always sets it).
+    #[tokio::test]
+    async fn page_set_bypass_csp_returns_empty_success() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("bypass-csp".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        let resp = dispatch(
+            &CdpRequest {
+                session_id: session,
+                params: json!({"enabled": true}),
+                ..req("Page.setBypassCSP")
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(
+            resp.error.is_none(),
+            "Page.setBypassCSP should not error: {:?}",
+            resp.error
+        );
+        assert_eq!(resp.result, Some(json!({})));
+    }
+
     #[tokio::test]
     async fn unknown_domain_still_errors() {
         let mut ctx = CdpContext::new();
@@ -1201,6 +1408,83 @@ mod tests {
         let err = resp.error.expect("unknown domain must surface as error");
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("Unknown domain"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_runtime_calls_do_not_force_screencast_frames() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let start = CdpRequest {
+            id: 2,
+            method: "Page.startScreencast".into(),
+            params: json!({}),
+            session_id: Some(session_id.clone()),
+        };
+        let response = dispatch(&start, &mut ctx).await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let evaluate = CdpRequest {
+            id: 3,
+            method: "Runtime.evaluate".into(),
+            params: json!({"expression": "document.title", "returnByValue": true}),
+            session_id: Some(session_id),
+        };
+        let response = dispatch(&evaluate, &mut ctx).await;
+        assert!(response.error.is_none(), "evaluate failed: {:?}", response.error);
+        assert!(
+            ctx.pending_events
+                .iter()
+                .all(|event| event.method != "Page.screencastFrame"),
+            "a read-only runtime call must not synchronously rasterize a frame"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutating_commands_schedule_screencast_after_the_command_response() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 2,
+                method: "Page.startScreencast".into(),
+                params: json!({}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 3,
+                method: "Emulation.setDefaultBackgroundColorOverride".into(),
+                params: json!({"color": {"r": 20, "g": 40, "b": 60}}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "override failed: {:?}", response.error);
+        assert!(ctx.pending_events.is_empty(), "frame must not delay the command response");
+        assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
+
+        crate::domains::page::pump_screencast_frames(&mut ctx).await;
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.screencastFrame"));
     }
 
     #[tokio::test]
@@ -1268,4 +1552,5 @@ mod tests {
         let err = resp.error.expect("malformed inner messages must error");
         assert_eq!(err.code, -32700);
     }
+
 }
