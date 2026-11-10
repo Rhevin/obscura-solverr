@@ -16,8 +16,8 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, env_allows_private_network, fetch_file_url, is_forbidden_ip,
-    redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
+    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
+    redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, SsrfGuardResolver,
@@ -155,7 +155,7 @@ async fn read_wreq_body_limited(
     let mut body = Vec::with_capacity(capacity);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            ObscuraNetError::Network(format!("Failed to read body: {}", error))
+            ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
         })?;
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
@@ -187,10 +187,21 @@ async fn send_get_with_connection_reset_retry(
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
+    /// Lets `fetch_file_url` read local files. Off by default.
+    pub allow_file_access: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    user_agent: Option<String>,
+}
+
+/// Scripted fetch exposes these headers before consuming the bounded body.
+#[cfg(feature = "stealth")]
+pub struct StealthResponseHeaders {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: futures_util::future::BoxFuture<'static, Result<Vec<u8>, ObscuraNetError>>,
 }
 
 #[cfg(feature = "stealth")]
@@ -211,6 +222,14 @@ impl StealthHttpClient {
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
+            // Read a folded header line (obs-fold) as Chrome does instead of
+            // failing the response. Set after `emulation()`, which overwrites
+            // `http1_options`; the Chrome profile leaves them unset.
+            .http1_options(
+                wreq::http1::Http1Options::builder()
+                    .allow_obsolete_multiline_headers_in_responses(true)
+                    .build(),
+            )
             .timeout(Duration::from_secs(30))
             // SSRF guard: reject hostnames that resolve to a private/loopback
             // IP. Use the same opt-in as the `validate_url` calls below so
@@ -264,13 +283,22 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             allow_private_network,
+            allow_file_access: false,
             block_trackers: tracker_blocking_enabled(
                 std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
             ),
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            user_agent: None,
         }
+    }
+
+    /// Overrides the emulation's User-Agent for every request (`--user-agent`).
+    /// `None` keeps the Chrome145/Windows emulation UA untouched.
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -301,10 +329,38 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, request, callbacks, "GET", None, None).await
+    }
+
+    /// Continue a navigation without changing another page's headers or pool.
+    pub async fn fetch_navigation_request(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation_request_from_document(url, method, body, headers, None, callbacks).await
+    }
+
+    /// Fetch a navigation with an optional owning document, retaining it across redirects.
+    pub async fn fetch_navigation_request_from_document(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let request = initiator.map(ResourceRequest::navigation_from_document)
+            .unwrap_or_else(ResourceRequest::navigation);
+        self.fetch_request(url, request, callbacks, method, body, headers).await
+    }
+
+    async fn fetch_request(
+        &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>,
+        method: &str, mut body: Option<Vec<u8>>, mut request_headers: Option<HashMap<String, String>>,
+    ) -> Result<Response, ObscuraNetError> {
+        let mut method = wreq::Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            return fetch_file_url(url, request.max_response_bytes, self.allow_file_access).await;
         }
 
         let mut current_url = url.clone();
@@ -322,17 +378,18 @@ impl StealthHttpClient {
 
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
+        let mut referrer = request.referrer.clone().or_else(|| request.initiator.clone());
         let mut request_callback_fired = false;
 
         // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
             validate_request_mode(&request, &current_url)?;
-            let mut req = self.client.get(current_url.as_str());
+            let mut req = self.client.request(method.clone(), current_url.as_str());
 
             req = req
                 .header("accept", request.accept())
-                .header("sec-fetch-site", request_fetch_site(&request, &current_url))
+                .header("sec-fetch-site", request_fetch_site(&request, &current_url, redirect_tainted))
                 .header("sec-fetch-mode", request.mode.header_value())
                 .header("sec-fetch-dest", request.destination());
             if request.mode == RequestMode::Navigate {
@@ -340,7 +397,8 @@ impl StealthHttpClient {
                     .header("upgrade-insecure-requests", "1")
                     .header("sec-fetch-user", "?1");
             }
-            if let Some(referer) = request_referrer(&request, &current_url) {
+            let referer = request_referrer(referrer.as_ref(), &current_url);
+            if let Some(referer) = &referer {
                 req = req.header("referer", referer);
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
@@ -351,7 +409,7 @@ impl StealthHttpClient {
                     same_site_context(
                         &request,
                         &current_url,
-                        request.mode == crate::RequestMode::Navigate,
+                        matches!(method, wreq::Method::GET | wreq::Method::HEAD),
                     ),
                 )
             } else {
@@ -361,22 +419,37 @@ impl StealthHttpClient {
                 req = req.header("Cookie", &cookie_header);
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            let extra_headers = self.extra_headers.read().await;
+            let supplied = request_headers.as_ref();
+            let effective_headers = supplied.unwrap_or(&extra_headers);
+            if let Some(ua) = effective_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v)
+                .or(self.user_agent.as_ref()) {
+                req = req.header("user-agent", ua.as_str());
+            }
+            for (k, v) in effective_headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
                 if k.eq_ignore_ascii_case("origin") {
                     continue;
                 }
                 req = req.header(k.as_str(), v.as_str());
             }
-            if cors_required(&request, &current_url) {
-                req = req.header("origin", &request_origin);
+            if let Some(origin) = request_origin_header(&request, &current_url, &request_origin, matches!(method, wreq::Method::GET | wreq::Method::HEAD)) {
+                req = req.header("origin", origin);
             }
 
             let request_info = RequestInfo {
                 url: current_url.clone(),
-                method: "GET".to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                method: method.to_string(),
+                headers: effective_headers.clone(),
                 resource_type: request.resource_type,
             };
+
+            if let Some(bytes) = &body {
+                if method == wreq::Method::POST && !effective_headers.keys().any(|name| name.eq_ignore_ascii_case("content-type")) {
+                    req = req.header("content-type", "application/x-www-form-urlencoded");
+                }
+                req = req.body(bytes.clone());
+            }
+            drop(extra_headers);
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
                     callbacks.fire_request(&request_info).await;
@@ -385,15 +458,12 @@ impl StealthHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = send_get_with_connection_reset_retry(req, &current_url)
-                .await
+            let resp = if method == wreq::Method::GET {
+                send_get_with_connection_reset_retry(req, &current_url).await
+            } else { req.send().await }
+
                 .map_err(|e| {
-                    ObscuraNetError::Network(format!(
-                        "{}: {} (source: {:?})",
-                        current_url,
-                        e,
-                        e.source()
-                    ))
+                    ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
                 })?;
 
             let status = resp.status();
@@ -431,10 +501,25 @@ impl StealthHttpClient {
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
+                    referrer = referer.as_deref().map(Url::parse).transpose()
+                        .map_err(|error| ObscuraNetError::Network(format!("Invalid redirect referrer: {error}")))?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    if next_url.origin() != current_url.origin() {
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                        }
+                    }
                     redirects.push(current_url.clone());
                     current_url = next_url;
+                    if (status.as_u16() == 303 && method != wreq::Method::GET && method != wreq::Method::HEAD)
+                        || (matches!(status.as_u16(), 301 | 302) && method == wreq::Method::POST) {
+                        method = wreq::Method::GET; body = None;
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(),
+                                "content-type" | "content-encoding" | "content-language" | "content-location" | "content-length"));
+                        }
+                    }
                     continue;
                 }
             }
@@ -493,14 +578,32 @@ impl StealthHttpClient {
         cookie_context: Option<SameSiteContext>,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        let response = self.send_single_headers_with_context(
+            method, url, headers, body, cookie_context, store_cookies, 64 * 1024 * 1024,
+        ).await?;
+        Ok(Response {
+            url: url.clone(), status: response.status, headers: response.headers,
+            body: response.body.await?, redirected_from: Vec::new(),
+        })
+    }
+
+    /// Preserve request policy and cookie handling while deferring body reads.
+    pub async fn send_single_headers_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        max_body_bytes: usize,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
-            return Ok(Response {
+            return Ok(StealthResponseHeaders {
                 status: 0,
-                url: url.clone(),
                 headers: HashMap::new(),
-                body: Vec::new(),
-                redirected_from: Vec::new(),
+                body: Box::pin(async { Ok(Vec::new()) }),
             });
         }
 
@@ -515,10 +618,17 @@ impl StealthHttpClient {
                 req = req.header("cookie", &cookie_header);
             }
         }
-        for (k, v) in self.extra_headers.read().await.iter() {
+        let extra_headers = self.extra_headers.read().await;
+        if let Some(ua) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v)
+            .or_else(|| extra_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v))
+            .or(self.user_agent.as_ref()) {
+            req = req.header("user-agent", ua.as_str());
+        }
+        for (k, v) in extra_headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
             req = req.header(k.as_str(), v.as_str());
         }
-        for (k, v) in headers.iter() {
+        drop(extra_headers);
+        for (k, v) in headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
             req = req.header(k.as_str(), v.as_str());
         }
         if !body.is_empty() {
@@ -527,7 +637,7 @@ impl StealthHttpClient {
 
         let in_flight = InFlightGuard::new(&self.in_flight);
         let resp = req.send().await.map_err(|e| {
-            ObscuraNetError::Network(format!("{}: {}", url, e))
+            ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
         })?;
 
         let status = resp.status();
@@ -543,15 +653,14 @@ impl StealthHttpClient {
             .iter()
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
-        drop(in_flight);
-
-        Ok(Response {
-            url: url.clone(),
+        let body_url = url.clone();
+        Ok(StealthResponseHeaders {
             status: status.as_u16(),
             headers: response_headers,
-            body: resp_body,
-            redirected_from: Vec::new(),
+            body: Box::pin(async move {
+                let _in_flight = in_flight;
+                read_wreq_body_limited(resp, &body_url, max_body_bytes).await
+            }),
         })
     }
 
@@ -584,6 +693,36 @@ mod tests {
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
+
+    #[tokio::test]
+    async fn stealth_user_agent_override_has_one_wire_value_for_navigation_and_script_fetch() {
+        for scripted in [false, true] {
+            for override_mode in 0..if scripted { 3 } else { 2 } {
+                let extra = override_mode > 0;
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = Url::parse(&format!("http://{}/",listener.local_addr().unwrap())).unwrap();
+                let server = std::thread::spawn(move || {
+                    let (mut socket,_) = listener.accept().unwrap();
+                    let mut request=Vec::new();let mut bytes=[0;4096];
+                    while !request.windows(4).any(|part|part==b"\r\n\r\n") {
+                        let n=Read::read(&mut socket,&mut bytes).unwrap();assert!(n>0);request.extend_from_slice(&bytes[..n]);
+                    }
+                    Write::write_all(&mut socket,b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                    String::from_utf8(request).unwrap()
+                });
+                let client=StealthHttpClient::with_proxy(Arc::new(CookieJar::new()),None,true).with_user_agent(Some("TestingUA/1.0".into()));
+                if extra {client.extra_headers.write().await.insert("user-agent".into(),"HeaderUA/2.0".into());}
+                let request_headers = if override_mode == 2 { [("User-Agent".into(), "RequestUA/3.0".into())].into() } else { std::collections::HashMap::new() };
+                let response=if scripted {client.send_single("GET",&url,&request_headers,&[],true,true).await.unwrap()}
+                    else {client.fetch(&url).await.unwrap()};
+                assert_eq!(response.status,200);
+                let wire=server.join().unwrap();
+                let agents=wire.lines().filter_map(|line|line.split_once(':')).filter(|(name,_)|name.eq_ignore_ascii_case("user-agent"))
+                    .map(|(_,value)|value.trim()).collect::<Vec<_>>();
+                assert_eq!(agents,vec![if override_mode == 2 {"RequestUA/3.0"} else if extra {"HeaderUA/2.0"} else {"TestingUA/1.0"}],"scripted={scripted}, override={override_mode}: {wire}");
+            }
+        }
+    }
 
     // Mirrors client::ssrf_tests::resolver_blocks_hostname_that_resolves_to_loopback.
     // Both transports must agree: a host-string check alone cannot see that a
@@ -634,6 +773,21 @@ mod tests {
                 "{value:?} must disable tracker blocking"
             );
         }
+    }
+
+    // The stealth transport delegates file:// to the shared loader, so it
+    // inherits the same opt-in instead of reading local files unconditionally.
+    #[tokio::test]
+    async fn stealth_client_reads_file_urls_only_when_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.html");
+        std::fs::write(&path, "local-secret").unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+
+        let mut client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        assert!(client.fetch(&url).await.is_err());
+        client.allow_file_access = true;
+        assert_eq!(client.fetch(&url).await.unwrap().body, b"local-secret");
     }
 
     #[test]
@@ -791,10 +945,12 @@ mod tests {
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
             allow_private_network: true,
+            allow_file_access: false,
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            user_agent: None,
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client
@@ -811,6 +967,48 @@ mod tests {
 
         assert!(matches!(error, ObscuraNetError::Network(_)));
         assert_eq!(server.join().unwrap(), 1);
+    }
+
+    // See `navigation_accepts_a_folded_response_header` in client.rs: the
+    // stealth transport must read a folded header as Chrome does.
+    #[tokio::test]
+    async fn stealth_client_accepts_a_folded_response_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Security-Policy: default-src 'self'\n  https://a.example\n  https://b.example\r\ncontent-length: 6\r\nconnection: close\r\n\r\nfolded";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("a folded header must not fail the response");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "folded");
+    }
+
+    #[tokio::test]
+    async fn stealth_network_error_names_the_cause() {
+        // A port nobody listens on: the message must say the connection was
+        // refused instead of only "error sending request", and must not be a
+        // Debug dump of the error structs.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let message = client.fetch(&url).await.expect_err("nothing listens").to_string();
+        assert!(message.to_lowercase().contains("refused"), "{message}");
+        assert!(!message.contains("source: Some("), "{message}");
     }
 
     /// Serve one `Content-Encoding: gzip` response on an ephemeral port.

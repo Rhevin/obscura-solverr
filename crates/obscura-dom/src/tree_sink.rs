@@ -8,6 +8,48 @@ use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace, QualName};
 
 use crate::tree::{Attribute, DomTree, NodeData, NodeId, ShadowRootMode};
 
+const MAX_PARSER_DEPTH: usize = 512;
+
+impl DomTree {
+    fn parser_insertion_parent(&self, parent: NodeId) -> (NodeId, Option<usize>) {
+        if let Some((previous_parent, parent_depth, previous_child, child_depth)) =
+            self.parser_depth_cache.get()
+        {
+            let depth = if parent == previous_parent {
+                Some(parent_depth)
+            } else if parent == previous_child {
+                Some(child_depth)
+            } else {
+                None
+            };
+            if let Some(depth) = depth {
+                if depth <= MAX_PARSER_DEPTH {
+                    return (parent, Some(depth));
+                }
+                let up = self.with_node(parent, |node| node.parent).flatten().unwrap_or(parent);
+                return (up, Some(depth - 1));
+            }
+        }
+        let inner = self.borrow_inner();
+        let mut depth = 0;
+        let mut current = parent;
+        while let Some(up) = inner.nodes.get(current.index())
+            .and_then(Option::as_ref).and_then(|node| node.parent)
+        {
+            depth += 1;
+            if depth > MAX_PARSER_DEPTH {
+                let insertion_parent = inner.nodes.get(parent.index()).and_then(Option::as_ref)
+                    .and_then(|node| node.parent).unwrap_or(parent);
+                let known_depth = inner.nodes.get(up.index()).and_then(Option::as_ref)
+                    .is_some_and(|node| node.parent.is_none()).then_some(depth - 1);
+                return (insertion_parent, known_depth);
+            }
+            current = up;
+        }
+        (parent, Some(depth))
+    }
+}
+
 /// DOM's valid-shadow-host-name predicate. Gecko's
 /// `nsContentUtils::IsValidShadowHostName` uses this same HTML allowlist plus
 /// valid custom-element names; keeping the check at the parser boundary makes
@@ -75,25 +117,27 @@ fn is_valid_shadow_host(tree: &DomTree, id: NodeId) -> bool {
     )
 }
 
+/// The element name html5ever asks for while parsing. A `Ref` into the tree's
+/// `RefCell` keeps the borrow alive for exactly as long as the name is used,
+/// so the borrow checker enforces what a raw pointer plus a phantom guard
+/// used to promise by convention.
 pub struct ObscuraElemName<'a> {
-    _ref: Ref<'a, ()>,
-    name: *const QualName,
+    name: Ref<'a, QualName>,
 }
 
 impl<'a> fmt::Debug for ObscuraElemName<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = unsafe { &*self.name };
-        write!(f, "{:?}", name)
+        write!(f, "{:?}", &*self.name)
     }
 }
 
 impl<'a> ElemName for ObscuraElemName<'a> {
     fn ns(&self) -> &Namespace {
-        unsafe { &(*self.name).ns }
+        &self.name.ns
     }
 
     fn local_name(&self) -> &LocalName {
-        unsafe { &(*self.name).local }
+        &self.name.local
     }
 }
 
@@ -113,19 +157,18 @@ impl TreeSink for DomTree {
     }
 
     fn elem_name<'a>(&'a self, target: &'a NodeId) -> ObscuraElemName<'a> {
-        let borrow = self.borrow_inner();
-        let node = borrow.nodes.get(target.index())
-            .and_then(|n| n.as_ref())
-            .expect("elem_name called on invalid node");
-        let name_ptr: *const QualName = match &node.data {
-            NodeData::Element { name, .. } => name as *const QualName,
-            _ => panic!("elem_name called on non-element"),
-        };
-        let ref_guard = Ref::map(borrow, |_| &());
-        ObscuraElemName {
-            _ref: ref_guard,
-            name: name_ptr,
-        }
+        let name = Ref::map(self.borrow_inner(), |inner| {
+            let node = inner
+                .nodes
+                .get(target.index())
+                .and_then(|n| n.as_ref())
+                .expect("elem_name called on invalid node");
+            match &node.data {
+                NodeData::Element { name, .. } => name,
+                _ => panic!("elem_name called on non-element"),
+            }
+        });
+        ObscuraElemName { name }
     }
 
     fn create_element(
@@ -177,12 +220,25 @@ impl TreeSink for DomTree {
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
         match child {
             NodeOrText::AppendNode(node_id) => {
-                self.append_child(*parent, node_id);
+                // Chromium flattens further parser insertions at this depth
+                // without changing the tree builder's open-elements stack.
+                let (insertion_parent, depth) = self.parser_insertion_parent(*parent);
+                self.append_child(insertion_parent, node_id);
+                let cache = depth.filter(|_| {
+                    self.with_node(node_id, |node| node.parent).flatten() == Some(insertion_parent)
+                }).map(|depth| (insertion_parent, depth, node_id, depth + 1));
+                self.parser_depth_cache.set(cache);
             }
             NodeOrText::AppendText(text) => {
+                let cache = self.parser_depth_cache.get();
                 self.append_text(*parent, &text);
+                self.parser_depth_cache.set(cache);
             }
         }
+    }
+
+    fn associate_with_form(&self, target: &NodeId, form: &NodeId, nodes: (&NodeId, Option<&NodeId>)) {
+        self.set_parser_form_owner(*target, *form, *nodes.0);
     }
 
     fn append_based_on_parent_node(
@@ -361,6 +417,17 @@ pub fn parse_html(html: &str) -> DomTree {
         .one(html.as_bytes())
 }
 
+/// Parse an iframe srcdoc with its standards-mode and scripting rules.
+pub fn parse_srcdoc(html: &str, scripting_enabled: bool) -> DomTree {
+    use html5ever::tendril::TendrilSink;
+    let tree = DomTree::new();
+    tree.set_allow_declarative_shadow_roots(true);
+    let mut opts = html5ever::ParseOpts::default();
+    opts.tree_builder.iframe_srcdoc = true;
+    opts.tree_builder.scripting_enabled = scripting_enabled;
+    html5ever::parse_document(tree, opts).from_utf8().one(html.as_bytes())
+}
+
 pub fn parse_fragment(html: &str) -> DomTree {
     let context_name = QualName::new(None, ns!(html), local_name!("body"));
     parse_fragment_with_context(html, context_name)
@@ -388,6 +455,97 @@ pub fn parse_fragment_with_context(html: &str, context_name: QualName) -> DomTre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn max_div_nesting(tree: &DomTree) -> usize {
+        let mut stack = vec![(tree.document(), 0)];
+        let mut maximum = 0;
+        while let Some((id, depth)) = stack.pop() {
+            let is_div = tree.with_node(id, |node| {
+                node.as_element().is_some_and(|name| name.local.as_ref() == "div")
+            }).unwrap_or(false);
+            let depth = depth + usize::from(is_div);
+            maximum = maximum.max(depth);
+            stack.extend(tree.children(id).into_iter().map(|child| (child, depth)));
+        }
+        maximum
+    }
+
+    #[test]
+    fn document_parser_caps_nesting_without_dropping_content() {
+        for (count, expected_depth) in [(400, 400), (1000, 511), (100000, 511)] {
+            let tree = parse_html(&format!("{}content", "<div>".repeat(count)));
+            assert_eq!(max_div_nesting(&tree), expected_depth);
+            assert_eq!(tree.query_selector_all("div").unwrap().len(), count);
+            assert_eq!(tree.text_content(tree.document()), "content");
+        }
+    }
+
+    #[test]
+    fn fragment_parser_caps_nesting_without_dropping_content() {
+        for (count, expected_depth) in [(400, 400), (1000, 512), (100000, 512)] {
+            let tree = parse_fragment(&format!("{}content", "<div>".repeat(count)));
+            assert_eq!(max_div_nesting(&tree), expected_depth);
+            assert_eq!(tree.query_selector_all("div").unwrap().len(), count);
+            assert_eq!(tree.text_content(tree.document()), "content");
+        }
+    }
+
+    #[test]
+    fn parser_depth_cap_does_not_restrict_dom_mutations() {
+        let tree = parse_html("<main id='root'></main>");
+        let mut parent = tree.get_element_by_id("root").unwrap();
+        for _ in 0..600 {
+            let child = tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), local_name!("div")),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            });
+            tree.append_child(parent, child);
+            parent = child;
+        }
+        assert_eq!(max_div_nesting(&tree), 600);
+    }
+
+    #[test]
+    fn parser_depth_cache_is_invalidated_by_reparenting() {
+        let tree = parse_html("<main id='deep'></main><section id='shallow'></section>");
+        let mut deep = tree.get_element_by_id("deep").unwrap();
+        for _ in 0..600 {
+            let child = tree.create_element(QualName::new(None, ns!(html), local_name!("div")),
+                vec![], ElementFlags::default());
+            tree.append_child(deep, child);
+            deep = child;
+        }
+        let shallow = tree.get_element_by_id("shallow").unwrap();
+        let leaf = tree.create_element(QualName::new(None, ns!(html), local_name!("div")),
+            vec![], ElementFlags::default());
+        TreeSink::append(&tree, &shallow, NodeOrText::AppendNode(leaf));
+        assert_eq!(tree.parser_insertion_parent(leaf).0, leaf);
+        tree.append_child(deep, shallow);
+        assert_eq!(tree.parser_insertion_parent(leaf).0, shallow);
+    }
+
+    #[test]
+    fn parser_depth_cache_is_invalidated_when_nodes_leave_a_deep_parent() {
+        for mutation in ["append", "insert", "detach", "raw"] {
+            let tree = parse_html(&"<div>".repeat(1000));
+            let leaf = *tree.query_selector_all("div").unwrap().last().unwrap();
+            let parent = tree.with_node(leaf, |node| node.parent).flatten().unwrap();
+            assert_eq!(tree.parser_insertion_parent(leaf).0, parent);
+            let document = tree.document();
+            let html = tree.children(document)[0];
+            match mutation {
+                "append" => tree.append_child(document, leaf),
+                "insert" => tree.insert_before(html, leaf),
+                "detach" => tree.detach(leaf),
+                "raw" => { tree.with_node_mut(leaf, |node| node.parent = None); }
+                _ => unreachable!(),
+            }
+            let expected_depth = usize::from(matches!(mutation, "append" | "insert"));
+            assert_eq!(tree.parser_insertion_parent(leaf), (leaf, Some(expected_depth)));
+        }
+    }
 
     #[test]
     fn test_parse_simple_html() {
